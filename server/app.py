@@ -64,11 +64,16 @@ def list_runs() -> list[dict]:
         except json.JSONDecodeError:
             continue
         iou = (rec.get("fit") or {}).get("iou")
+        # Say WHAT is placed: a generated mesh, or the footprint extruded to the
+        # OSM height. Both are real placements; only one involved TRELLIS.
+        frame = (rec.get("mesh_to_enu") or {}).get("mesh_frame")
+        kind = {"gltf_scene": "mesh", "unit_box_centred": "prism"}.get(frame, "?")
         out.append({
             "asset_id": rec["asset_id"],
-            "label": (f"{rec.get('address_raw', '?')} · {rec.get('decision', '?')}"
+            "label": (f"{rec.get('address_raw', '?')} · {kind} · {rec.get('decision', '?')}"
                       + (f" · IoU {iou:.2f}" if isinstance(iou, (int, float)) else "")),
             "decision": rec.get("decision"),
+            "kind": kind,
         })
     return out
 

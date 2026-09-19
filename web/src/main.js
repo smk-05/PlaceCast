@@ -174,24 +174,49 @@ async function drawBuilding(rec) {
     });
     viewer.scene.primitives.add(model);
   } else if (m2e.mesh_frame === 'unit_box_centred') {
-    // Dry run: the hour-6 milestone object, a unit box placed by its own matrix.
-    viewer.scene.primitives.add(new Cesium.Primitive({
-      geometryInstances: new Cesium.GeometryInstance({
-        geometry: Cesium.BoxGeometry.fromDimensions({
-          dimensions: new Cesium.Cartesian3(1, 1, 1),
-          vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
-        }),
-        modelMatrix,
-        attributes: {
-          color: Cesium.ColorGeometryInstanceAttribute.fromColor(
-            Cesium.Color.fromCssColorString('#e8590c').withAlpha(0.7),
-          ),
-        },
-      }),
-      appearance: new Cesium.PerInstanceColorAppearance({ translucent: true }),
-    }));
+    // No generated mesh. Draw the AUTHORITATIVE footprint extruded to the
+    // resolved height (spec 7) instead of the hour-6 unit box: the box is the
+    // footprint's OMBB, so an L-shaped building came out rectangular, and the
+    // box's own IoU (0.65-0.92) measured the rectangle approximation rather
+    // than the placement. The prism is exact in plan by construction — what it
+    // still shows is everything the placement chain contributes: which
+    // building, its outline, its height, and the ground it stands on.
+    drawFootprintPrism(rec, ground);
   } else {
     errEl.textContent = `Unknown mesh_frame "${m2e.mesh_frame}" — not drawing anything.`;
+  }
+}
+
+/** The footprint extruded to the resolved height, for records with no mesh. */
+function drawFootprintPrism(rec, ground) {
+  const geom = rec.footprint_geojson;
+  const height = rec.height?.value_m;
+  if (!geom || !height) {
+    errEl.textContent = 'No mesh and no height — nothing to draw.';
+    return;
+  }
+  // Every ring, so courtyards stay holes and Lane Stadium keeps its stands.
+  const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
+  for (const rings of polys) {
+    viewer.entities.add({
+      name: 'footprint prism',
+      polygon: {
+        hierarchy: new Cesium.PolygonHierarchy(
+          Cesium.Cartesian3.fromDegreesArray(rings[0].flatMap(([lon, lat]) => [lon, lat])),
+          rings.slice(1).map(
+            (r) => new Cesium.PolygonHierarchy(
+              Cesium.Cartesian3.fromDegreesArray(r.flatMap(([lon, lat]) => [lon, lat])),
+            ),
+          ),
+        ),
+        perPositionHeight: false,
+        height: ground,                       // pinned terrain, as for a mesh
+        extrudedHeight: ground + height,
+        material: Cesium.Color.fromCssColorString('#c9a227').withAlpha(0.85),
+        outline: true,
+        outlineColor: Cesium.Color.fromCssColorString('#5c4708'),
+      },
+    });
   }
 }
 

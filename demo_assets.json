@@ -1,0 +1,62 @@
+{
+  "ncb": {
+    "address": "Classroom Building, Blacksburg, VA",
+    "asset_id": "3289ae77-ac15-44b2-85c7-91e1d7568845",
+    "photo": "ncb_5.jpg",
+    "perception": "real",
+    "decision": "reject",
+    "iou": 0.796,
+    "hausdorff_m": 9.89,
+    "disambiguated_by": "exif_heading"
+  },
+  "burruss": {
+    "address": "Burruss Hall, Blacksburg, VA",
+    "asset_id": "3f1a4bcd-3179-44c6-a503-7a50b65a90ad",
+    "photo": "burruss_1.jpg",
+    "perception": "real",
+    "decision": "reject",
+    "iou": 0.775,
+    "hausdorff_m": 30.71,
+    "disambiguated_by": "exif_heading"
+  },
+  "patton": {
+    "address": "Patton Hall, Blacksburg, VA",
+    "asset_id": "d354f660-4c4a-493a-bf30-df6c261ef2b7",
+    "photo": "patton_1.jpg",
+    "perception": "real",
+    "decision": "reject",
+    "iou": 0.328,
+    "hausdorff_m": 55.3,
+    "disambiguated_by": "exif_heading"
+  },
+  "warmemorial": {
+    "address": "War Memorial Hall, Blacksburg, VA",
+    "asset_id": "1ddda74b-0743-4aa6-b511-70f36efedc67",
+    "photo": "warmemorial_2.jpg",
+    "perception": "real",
+    "decision": "reject",
+    "iou": 0.451,
+    "hausdorff_m": 27.17,
+    "disambiguated_by": "exif_heading"
+  },
+  "whittemore": {
+    "address": "Whittemore Hall, Blacksburg, VA",
+    "asset_id": "bb2d9dc1-d970-463f-b287-bfe3b9936875",
+    "photo": "whittemore_1.jpg",
+    "perception": "real",
+    "decision": "reject",
+    "iou": 0.541,
+    "hausdorff_m": 22.53,
+    "disambiguated_by": "exif_heading"
+  },
+  "goodwin": {
+    "address": "Goodwin Hall, Blacksburg, VA",
+    "asset_id": "9868f0a7-0707-4790-83a5-bbbcac950bab",
+    "photo": "goodwin_1.jpg",
+    "perception": "real",
+    "decision": "reject",
+    "iou": 0.589,
+    "hausdorff_m": 37.51,
+    "disambiguated_by": "exif_heading"
+  }
+}
