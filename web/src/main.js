@@ -248,6 +248,7 @@ async function drawBuilding(rec, ground, stillCurrent = () => true) {
     // still shows is everything the placement chain contributes: which
     // building, its outline, its height, and the ground it stands on.
     drawFootprintPrism(rec, ground);
+    drawOpenings(rec, enuToFixed);
   } else {
     errEl.textContent = `Unknown mesh_frame "${m2e.mesh_frame}" — not drawing anything.`;
   }
@@ -271,6 +272,40 @@ function drawFootprintPrism(rec, ground) {
       outlineColour: Cesium.Color.fromCssColorString('#5c4708'),
     });
   }
+}
+
+/**
+ * Facade openings on the prism (perception/openings_prism.py writes rec.openings): one thin box per opening,
+ * width x height x 0.1 m, on its wall. position_enu / normal_enu are in the same ENU frame as the prism, so the
+ * frame is the drawBuilding one. Local Y is up and local Z the outward normal, so local X = up x normal. REVIEW is
+ * red; the other colours are per type, as in perception/openings_3d.py.
+ */
+const OPENING_COLOURS = { door: '#2ea043', entrance: '#009696', garage_door: '#f58c14', window: '#286ee6' };
+
+function drawOpenings(rec, enuToFixed) {
+  const items = (rec.openings || []).filter(
+    (o) => o.position_enu && o.normal_enu && o.width_m && o.height_m,
+  );
+  if (!items.length) return;
+  viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: items.map((o) => {
+      const [nx, ny] = o.normal_enu;
+      const [e, n, u] = o.position_enu;
+      const local = Cesium.Matrix4.fromColumnMajorArray([-ny, nx, 0, 0, 0, 0, 1, 0, nx, ny, 0, 0, e, n, u, 1]);
+      const css = o.decision === 'REVIEW' ? '#dc2828' : (OPENING_COLOURS[o.type] || '#969696');
+      return new Cesium.GeometryInstance({
+        id: o.id,
+        geometry: Cesium.BoxGeometry.fromDimensions({
+          dimensions: new Cesium.Cartesian3(o.width_m, o.height_m, 0.1),
+          vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+        }),
+        modelMatrix: Cesium.Matrix4.multiply(enuToFixed, local, new Cesium.Matrix4()),
+        attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(Cesium.Color.fromCssColorString(css)) },
+      });
+    }),
+    appearance: new Cesium.PerInstanceColorAppearance({ translucent: false }),
+    asynchronous: false,
+  }));
 }
 
 /**

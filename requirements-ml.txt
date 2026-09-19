@@ -49,3 +49,4 @@ matplotlib>=3.9                 # reliability diagram, coefficient table
 # --- facade openings 3-D (perception/openings_3d.py) ---
 pygltflib>=1.16
 rtree>=1.2                      # trimesh.ray.intersects_location
+mapbox-earcut>=1.0               # trimesh.creation.extrude_polygon (openings_prism)

@@ -29,3 +29,4 @@ scikit-learn>=1.5               # confidence/train.py — the gate is trained on
 
 pygltflib>=1.16               # perception/openings_3d.py: per-node extras on the exported glb
 rtree>=1.2                     # trimesh.ray (intersects_location) needs it; without it ray-casting raises
+mapbox-earcut>=1.0              # perception/openings_prism.py: trimesh.creation.extrude_polygon needs a triangulator
