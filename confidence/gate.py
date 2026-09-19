@@ -42,6 +42,7 @@ Hard rules, applied on BOTH methods. Each sets a floor under the decision; they 
           high IoU against the WRONG building is the most dangerous output this pipeline can produce
   review  multi-part footprint (fp.is_multipart): the OMBB and rotation come from the largest part only
   review  EXIF and the silhouette picked different candidates (fit.exif_silhouette_disagree is True)
+  review  height is not authoritative (not fit.height_source_authoritative: levels-only or untagged OSM; SPEC 7)
 
 Learned model (B.4): reads the model.json written by confidence/train.py: p >= p_accept -> auto_accept,
 p <= p_reject -> reject, else review; a threshold that training could not set (None) is never applied, so a
@@ -229,6 +230,8 @@ def hard_rules(fit, fp):
         rules.append((REVIEW, f"multi-part footprint ({1 + len(fp.parts_enu)} disjoint outer rings): the OMBB and rotation come from the largest part only"))
     if fit.exif_silhouette_disagree is True:
         rules.append((REVIEW, "EXIF and the silhouette picked different candidates - independent evidence conflicts (A.3)"))
+    if not fit.height_source_authoritative:
+        rules.append((REVIEW, "height is not authoritative (levels-only or untagged OSM) - capped at REVIEW (SPEC 7)"))
     return tuple(rules)
 
 
