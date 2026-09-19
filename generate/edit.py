@@ -27,6 +27,8 @@ from pathlib import Path
 
 import requests
 
+# Official model; inputs (input_image, prompt, seed, output_format) verified
+# against the live schema on 2026-09-19.
 MODEL = "black-forest-labs/flux-kontext-pro"
 
 # Spec 5.1: edits that mutate the silhouette break the fit. Rejected up front

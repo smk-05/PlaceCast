@@ -24,10 +24,13 @@ from pathlib import Path
 
 import requests
 
-MODEL = "firtoz/trellis"
+# A community model, so the version is PINNED: an unpinned run silently picks up
+# whatever the owner publishes next, which breaks spec 12.1's reproducibility.
+# Schema verified against this version on 2026-09-19.
+MODEL = ("firtoz/trellis:"
+         "e8f6c45206993f297372f5436b90350817bd9b4a0d52d2a76df50c1c8afa2b3c")
 
-# Replicate deployment defaults, recorded in the placement record so the result
-# is reproducible (spec 12.1).
+# Recorded in the placement record so the result is reproducible (spec 12.1).
 DEFAULT_PARAMS = {
     "ss_sampling_steps": 12,
     "slat_sampling_steps": 12,
@@ -35,7 +38,13 @@ DEFAULT_PARAMS = {
     "slat_guidance_strength": 3.0,
     "mesh_simplify": 0.95,      # quadric simplification retention
     "texture_size": 1024,       # 2048 only for hero assets (spec 13.3)
-    "generate_model": True,
+    "generate_model": True,     # the GLB — defaults to False on this deployment
+    # This deployment defaults randomize_seed to TRUE, which silently discards
+    # the seed we pass. Without this, spec 14's determinism is quietly broken.
+    "randomize_seed": False,
+    # Preview videos: extra GPU time we would pay for and never use.
+    "generate_color": False,
+    "generate_normal": False,
 }
 
 
