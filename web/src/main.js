@@ -360,12 +360,77 @@ function renderPanel(rec) {
   metaEl.innerHTML = `
     <div style="margin:8px 0"><span class="badge ${d}">${d.replace('_', ' ')}</span></div>
     ${note}
+    ${orientationPanel(rec)}
     <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>
     ${(rec.review_reasons || []).length
       ? `<div class="flags"><b>flags</b><ul>${rec.review_reasons
           .map((r) => `<li>${r}</li>`).join('')}</ul></div>`
       : ''}
   `;
+  wireOrientationButtons(rec);
+}
+
+/* Spec 9.3, the review queue's point: when the four-fold azimuth ambiguity is
+ * resolved wrongly, a person fixes it in one click. Each button re-solves the
+ * SAME asset with that azimuth — cached mesh, no model run, nothing billed. */
+function orientationPanel(rec) {
+  const o = rec.orientation;
+  if (!o || !o.candidates?.length) return '';
+  const buttons = o.candidates
+    .slice()
+    .sort((a, b) => a.k - b.k)
+    .map(({ k, iou }) => {
+      const chosen = k === o.chosen_k;
+      return `<button class="cand${chosen ? ' chosen' : ''}" data-k="${k}"
+        title="re-solve facing candidate ${k}">k=${k}<br><small>IoU ${iou.toFixed(2)}</small>
+        </button>`;
+    }).join('');
+  const how = o.forced_by_reviewer
+    ? `set by a reviewer (solver said k=${o.auto_k} via ${o.auto_disambiguated_by})`
+    : `chosen by ${o.auto_disambiguated_by}`;
+  return `<div class="flags"><b>orientation</b> — ${how}
+    <div class="cands">${buttons}</div>
+    <small>Pick a facing to re-solve. Free: the mesh is reused.</small>
+    <div id="choose-status"></div></div>`;
+}
+
+function wireOrientationButtons(rec) {
+  const status = document.getElementById('choose-status');
+  metaEl.querySelectorAll('button.cand').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const k = Number(b.dataset.k);
+      metaEl.querySelectorAll('button.cand').forEach((x) => { x.disabled = true; });
+      status.textContent = `re-solving with k=${k}…`;
+      try {
+        const res = await fetch(`/api/runs/${rec.asset_id}/choose`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ k }),
+        });
+        if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+        const { job_id: jobId } = await res.json();
+        const job = await waitForJob(jobId, status);
+        if (job.status === 'failed') throw new Error(job.error);
+        status.textContent = 'done — reloading';
+        await show(rec.asset_id);          // redraws with the new placement
+      } catch (e) {
+        status.textContent = `failed: ${e.message ?? e}`;
+        metaEl.querySelectorAll('button.cand').forEach((x) => { x.disabled = false; });
+      }
+    });
+  });
+}
+
+async function waitForJob(jobId, status, tries = 120) {
+  for (let i = 0; i < tries; i += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const job = await (await fetch(`/api/jobs/${jobId}`)).json();
+    if (job.status === 'done' || job.status === 'failed') return job;
+    status.textContent = `re-solving… (${job.status})`;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error('timed out waiting for the re-solve');
 }
 
 const fmt = (v, n) => (typeof v === 'number' ? v.toFixed(n) : '-');

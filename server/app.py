@@ -100,7 +100,8 @@ def review_queue() -> list[dict]:
             "decision": rec.get("decision"),
             "reasons": rec.get("review_reasons", []),
             "overlay": f"/assets-data/{rec['asset_id']}/overlay.png",
-            "candidates": (rec.get("fit") or {}).get("candidate_ious", {}),
+            "candidates": (rec.get("orientation") or {}).get("candidates", []),
+            "orientation": rec.get("orientation") or {},
         })
     return queue
 
@@ -116,6 +117,53 @@ def asset(asset_id: str, filename: str):
     if not path.exists():
         raise HTTPException(404, filename)
     return FileResponse(path)
+
+
+class ChooseRequest(BaseModel):
+    k: int  # azimuth candidate 0-3, as listed in record["orientation"]["candidates"]
+
+
+@app.post("/api/runs/{asset_id}/choose")
+def choose_orientation(asset_id: str, req: ChooseRequest) -> dict:
+    """Spec 9.3: a reviewer overrules the orientation. -> {"job_id": ...}.
+
+    Re-solves the SAME asset with the chosen azimuth: the cached edit and mesh
+    are reused, so no model runs again and nothing is billed. The run's own
+    inputs come from the record, so nothing else about it changes.
+    """
+    if req.k not in (0, 1, 2, 3):
+        raise HTTPException(400, f"k must be 0-3, got {req.k}")
+    rec = get_run(asset_id)
+    inputs = rec.get("inputs") or {}
+    if not inputs:
+        raise HTTPException(
+            409, "this record predates input provenance — re-run it once from "
+                 "the CLI with --asset-id before reviewing it")
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "queued", "asset_id": asset_id, "error": None}
+
+    def work():
+        _jobs[job_id]["status"] = "running"
+        try:
+            from pipeline import run
+
+            run(rec["address_raw"],
+                photos=[Path(p) for p in inputs.get("photos", [])],
+                prompt=inputs.get("prompt") or rec.get("prompt", ""),
+                dry_run=bool(inputs.get("dry_run")),
+                perception=inputs.get("perception", "stub"),
+                allow_anisotropy=bool(inputs.get("allow_anisotropy")),
+                seed=int(inputs.get("seed", 42)),
+                asset_id=asset_id,
+                mask_for_generation=bool(inputs.get("mask_for_generation", True)),
+                force_candidate=req.k)
+            _jobs[job_id].update(status="done")
+        except Exception as exc:  # noqa: BLE001
+            _jobs[job_id].update(status="failed", error=f"{type(exc).__name__}: {exc}")
+
+    _pool.submit(work)
+    return {"job_id": job_id}
 
 
 @app.post("/api/run")

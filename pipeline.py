@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 # gitignored. Without this they are silently absent and generation fails.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from contracts import Decision, PlacementRecord  # noqa: E402
+from contracts import CandidateId, Decision, PlacementRecord  # noqa: E402
 from geo import disambiguate, exif, fit as fitmod, height as heightmod, outline, placement, validate
 from geo.coords import ENUFrame
 from geo.footprint import build_footprint, fetch_osm, geocode, select_footprint, to_shapely
@@ -57,7 +57,8 @@ def run(address: str,
         allow_anisotropy: bool = False,
         seed: int = 42,
         asset_id: str | None = None,
-        mask_for_generation: bool = True) -> PlacementRecord:
+        mask_for_generation: bool = True,
+        force_candidate: int | None = None) -> PlacementRecord:
 
     asset_id = asset_id or str(uuid.uuid4())
     run_dir = DATA_DIR / asset_id
@@ -152,7 +153,22 @@ def run(address: str,
         vertices_canonical=(outline.canonicalise(mesh_vertices, mo.up_axis_idx)[0]
                             if mesh_vertices is not None else None),
     )
-    log(f"orientation: k={chosen.azimuth_k} via {by.value}")
+    # Spec 9.3: a reviewer overrules the automatic choice. The four candidates
+    # are the same k the overlay and the record list, so a human picks by
+    # number. Only the azimuth is overridden — the up-axis is geometry, not
+    # opinion. The automatic choice is kept in the record next to the override,
+    # because "the human disagreed with EXIF" is worth knowing later.
+    auto_choice, auto_by = chosen, by
+    if force_candidate is not None:
+        k = int(force_candidate) % 4
+        chosen = CandidateId(up_axis_idx=mo.up_axis_idx, azimuth_k=k)
+        reasons = [*reasons,
+                   f"orientation set by a reviewer to k={k} "
+                   f"(the solver chose k={auto_choice.azimuth_k} via {auto_by.value})"]
+        log(f"orientation: FORCED to k={k} by a reviewer "
+            f"(auto was k={auto_choice.azimuth_k} via {auto_by.value})")
+    else:
+        log(f"orientation: k={chosen.azimuth_k} via {by.value}")
     for r in reasons:
         log(f"  note: {r}")
 
@@ -248,6 +264,27 @@ def run(address: str,
     record_dict = record.to_json_dict()
     record_dict["mesh_to_enu"] = placement.record_entry(m2e, frame_name)
     record_dict["facade"] = _facade_entry(fp, mo, chosen, result, front_source, log)
+    # What this run was made from, so a review re-run reproduces it exactly
+    # (spec 9.3: the reviewer changes the orientation, nothing else).
+    record_dict["inputs"] = {
+        "photos": [str(p) for p in (photos or [])],
+        "perception": perception,
+        "dry_run": bool(dry_run),
+        "prompt": prompt,
+        "seed": seed,
+        "allow_anisotropy": bool(allow_anisotropy),
+        "mask_for_generation": bool(mask_for_generation),
+    }
+    record_dict["orientation"] = {
+        "chosen_k": chosen.azimuth_k,
+        "up_axis_idx": mo.up_axis_idx,
+        "auto_k": auto_choice.azimuth_k,
+        "auto_disambiguated_by": auto_by.value,
+        "forced_by_reviewer": force_candidate is not None,
+        # Every candidate's footprint IoU, so the reviewer picks by evidence.
+        "candidates": [{"k": cid.azimuth_k, "iou": round(float(v), 4)}
+                       for cid, v in scored],
+    }
 
     record_path = run_dir / "record.json"
     record_path.write_text(json.dumps(record_dict, indent=2, default=str),
@@ -610,6 +647,10 @@ def main(argv=None) -> int:
     ap.add_argument("--asset-id", default=None,
                     help="re-use an existing run directory: its cached edit and "
                          "mesh are used, so no model is re-run and nothing is billed")
+    ap.add_argument("--force-candidate", type=int, default=None, choices=[0, 1, 2, 3],
+                    help="spec 9.3 review: re-solve with this azimuth candidate "
+                         "instead of the disambiguator's choice. Free with "
+                         "--asset-id: no model runs again")
     ap.add_argument("--no-mask", action="store_true",
                     help="generate from the raw photo even when a real mask "
                          "exists (the before/after comparison for plan 3.1)")
@@ -621,7 +662,8 @@ def main(argv=None) -> int:
                   confidence_method=args.confidence,
                   allow_anisotropy=args.anisotropy, seed=args.seed,
                   asset_id=args.asset_id,
-                  mask_for_generation=not args.no_mask)
+                  mask_for_generation=not args.no_mask,
+                  force_candidate=args.force_candidate)
     except (LookupError, RuntimeError, ValueError) as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         return 1
