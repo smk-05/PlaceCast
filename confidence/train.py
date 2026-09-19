@@ -450,6 +450,8 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default=None,
                         help=f"default {DEFAULT_OUT_DIR}, or {DEFAULT_OUT_DIR / 'benchmark'} for --source benchmark")
+    parser.add_argument("--markdown", default=None,
+                        help="--source benchmark only: insert or replace the Learned gate section in this file (BENCHMARK.md)")
     parser.add_argument("--accept-precision", type=float, default=ACCEPT_PRECISION)
     parser.add_argument("--reject-precision", type=float, default=REJECT_PRECISION)
     args = parser.parse_args(argv)
@@ -461,6 +463,8 @@ def main(argv=None):
             report = benchmark_eval.evaluate(rows, args.seed, args.accept_precision, args.reject_precision)
             print(benchmark_eval.format_report(report))
             out = benchmark_eval.write_artifacts(report, args.out_dir or DEFAULT_OUT_DIR / "benchmark")
+            if args.markdown:
+                print(f"markdown: {benchmark_eval.write_markdown(report, args.markdown)}")
             print(f"\nartifacts: {out}")
             return 0
         result = train(rows, args.seed, args.accept_precision, args.reject_precision)

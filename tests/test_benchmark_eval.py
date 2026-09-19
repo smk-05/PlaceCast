@@ -116,3 +116,29 @@ def test_the_assumption_never_touches_the_hard_rules_or_the_features(no_height_r
     before = inspect.getsource(gate.hard_rules)
     benchmark_eval.evaluate(no_height_rows, seed=0, authoritative_height=True)
     assert inspect.getsource(gate.hard_rules) == before
+
+
+# ------------------------------------------------------------- the BENCHMARK.md section
+
+
+def test_the_markdown_section_says_what_the_data_is_and_that_the_table_stays_default(report):
+    md = benchmark_eval.markdown_section(report)
+    assert "synthetic corruptions of real footprints, scored against known truth" in md
+    assert "The threshold table remains the default confidence method" in md
+    assert "### Wrong auto-accepts" in md and "### Per corruption" in md and "### Mirrors" in md
+    assert md.startswith(benchmark_eval.MD_START) and md.rstrip().endswith(benchmark_eval.MD_END)
+    eq = report["equal_coverage"]
+    assert eq is None or f"| {eq['accepts']} | **{eq['wrong_accepts']}**" in md  # the numbers in the text are the measured ones
+
+
+def test_writing_the_section_appends_once_then_replaces_in_place(tmp_path, report):
+    doc = tmp_path / "BENCHMARK.md"
+    doc.write_text("# Benchmark\n\nexisting table\n", encoding="utf-8")
+    benchmark_eval.write_markdown(report, doc)
+    first = doc.read_text(encoding="utf-8")
+    assert first.startswith("# Benchmark\n\nexisting table\n") and first.count(benchmark_eval.MD_START) == 1
+    benchmark_eval.write_markdown(report, doc)
+    assert doc.read_text(encoding="utf-8") == first  # idempotent: no duplicate section, nothing else moved
+    doc.write_text(first.replace("existing table", "edited table"), encoding="utf-8")
+    benchmark_eval.write_markdown(report, doc)
+    assert "edited table" in doc.read_text(encoding="utf-8")  # text outside the markers is never touched

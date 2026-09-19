@@ -81,3 +81,57 @@ way, and IoU cannot tell. That gap is what EXIF headings and silhouettes close.
 | Durham Hall | complex | 0.826 | 2.80 | 2715 |
 | Holden Hall | near_square | 0.997 | 1.11 | 2700 |
 | War Memorial Hall | near_square | 1.000 | 1.14 | 8471 |
+
+<!-- learned-gate:start -->
+
+## Learned gate (leave-one-building-out)
+
+Data: synthetic corruptions of real footprints, scored against known truth. The 20 buildings and 1680 rows above, 66.5% of them acceptable. This measures the gate against known truth on the solver's failure modes; it is not a set of human-judged placements of generated meshes.
+
+**The threshold table remains the default confidence method.** The learned gate stays behind `PROCEDURA_LEARNED_GATE` (or `--confidence learned`), no benchmark-trained model is shipped, and this evaluation calls `hard_rules()` without changing it. The numbers below are why.
+
+**Method.** Each fold holds out one whole building (the 84 rows of a building share a footprint, so row-level cross-validation would leak). C and both thresholds are chosen from the other 19 buildings. Constant columns are dropped (rotation_margin_silhouette, max_neighbor_overlap, height_source_authoritative). Both methods are read as production reads them: the method's decision floored by `hard_rules()`.
+
+**Height.** The benchmark is 2D, so every row carries `proportional_fallback`, which the gate's height rule floors to REVIEW: the table as it stands makes 0 auto-accepts on these rows, not the 12 listed above (this document was generated at commit e16228e; the height rule, 40b15c0, came after it). Both methods here are scored as if the height were authoritative, which gives the table 391 auto-accepts and 12 wrong, the same 12 as above.
+
+**Discrimination.** Pooled out-of-fold AUC 0.921; accuracy 0.892 at 0.5 (always-predict-majority: 0.665). Per-fold accuracy: mean 0.892, min 0.548, max 1.000; weakest Price Hall 0.548, Cassell Coliseum 0.702, McBryde Hall 0.702.
+
+### Wrong auto-accepts
+
+| method | accepted | wrong | coverage |
+|---|---|---|---|
+| table | 391 | **12** | 23% |
+| learned, thresholds chosen inside each fold | 490 | **27** | 29% |
+| learned model alone (no hard rules) | 582 | 44 | 35% |
+| learned at the table's coverage (p >= 0.958) | 391 | **15** | 23% |
+| learned, the threshold with 0 wrong (p >= 0.983) | 232 | **0** | 14% |
+
+At the table's coverage the learned gate makes 15 wrong accepts to the table's 12, so it is not safer. Its advantage is that it accepts more good placements (463 vs 379) and wrongly rejects far fewer (24 vs 397). The last two rows use one threshold chosen on the out-of-fold predictions they are scored on, so they are optimistic; the thresholds each fold chose from its own training buildings gave realised precision 94.5% against a 95% target.
+
+### Per corruption
+
+| corruption | n | good | learned error @0.5 | learned accepted | learned wrong | table accepted | table wrong | learned wrong rejects | table wrong rejects |
+|---|---|---|---|---|---|---|---|---|---|
+| anisotropy | 240 | 92% | 6.2% | 33 | 0 | 8 | 0 | 0 | 57 |
+| clean | 240 | 100% | 0.0% | 168 | 0 | 192 | 0 | 0 | 0 |
+| lobe | 240 | 71% | 16.7% | 75 | 0 | 0 | 0 | 2 | 166 |
+| mirror | 240 | 20% | 20.4% | 24 | 24 | 24 | 12 | 0 | 0 |
+| mislabel_90 | 240 | 5% | 17.9% | 11 | 3 | 7 | 0 | 0 | 2 |
+| missing_wing | 240 | 82% | 11.2% | 48 | 0 | 25 | 0 | 22 | 169 |
+| noise | 240 | 95% | 3.3% | 131 | 0 | 135 | 0 | 0 | 3 |
+
+### Coefficients
+
+Standardised, largest first: footprint_iou +4.23, abs_area_ratio_log +1.21, rotation_margin_footprint +1.08, hausdorff_m +0.48, abs_anisotropy_log_ratio -0.15, geocode_rooftop +0.07, rectilinearity -0.03.
+
+abs_area_ratio_log, hausdorff_m come out with the opposite sign to the one expected. The reason is the label, not a bug: it measures **pose correctness** (the undamaged outline placed with the recovered pose must reach IoU 0.80 against truth, and the rotation must be within 10 degrees), not shape. A lobe or a missing wing inflates Hausdorff distance and area ratio while leaving the pose right, so in this data a larger Hausdorff or area error does not mean a worse label; with footprint IoU in the model these features act as corrections and take that sign. That is a property of this benchmark's labels, not evidence that Hausdorff distance stops mattering for real generated meshes, and it is also why the table's 397 wrong rejects (mostly lobe and missing_wing, which Hausdorff rejects) look worse here than they would to a person.
+
+rectilinearity (-0.03) also miss their expected sign but are indistinguishable from zero, so there is nothing to explain.
+
+### Mirrors
+
+Mirrors cannot be caught from the geometry features. Of 240 mirror rows, 48 are good (a symmetric plan makes the reflection invisible in 2D). The fit never flags a mirror: 0 of them carry a negative scale, because the reflection is baked into the outline and the solver returns an ordinary positive-scale fit, so the mirror hard rule has nothing to fire on. The features then only see how well the reflected outline happens to fit the footprint, and where it fits well (near-symmetric plans, e.g. Cassell Coliseum at IoU 0.994 in the false accepts above) a wrong pose is indistinguishable from a right one. Nothing in the feature vector encodes handedness. The learned gate accepts 24 mirror rows, 24 of them wrong (the table: 24 accepted, 12 wrong); mislabel_90 shows the same pattern at a smaller scale. Catching these needs evidence beyond the footprint fit (a facade or silhouette cue, or a handedness check on the mesh itself), not a better model on these features.
+
+Regenerate this section with `python confidence/train.py --source benchmark --markdown BENCHMARK.md` (`scripts/run_benchmark.py` rewrites the whole file and drops it).
+
+<!-- learned-gate:end -->
