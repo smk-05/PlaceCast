@@ -18,7 +18,8 @@
 import * as Cesium from 'cesium';
 import 'cesium/Build/Cesium/Widgets/widgets.css';
 
-const TOKEN = import.meta.env.VITE_CESIUM_ION_TOKEN;
+const TOKEN = import.meta.env.CESIUM_ION_TOKEN || import.meta.env.VITE_CESIUM_ION_TOKEN;
+if (!TOKEN) console.warn('No CESIUM_ION_TOKEN in the root .env: World Terrain will not load.');
 if (TOKEN) Cesium.Ion.defaultAccessToken = TOKEN;
 
 const viewer = new Cesium.Viewer('cesium', {
@@ -109,62 +110,67 @@ function drawFootprint(rec) {
 }
 
 /**
- * Place the mesh — or, before generation exists, the spec 15 hour-6 unit cube.
+ * Place the mesh — or, on a dry run, the spec 15 hour-6 box.
  *
- * Everything georeferencing goes into the model matrix, per spec 13.1.
+ * ALL of the placement comes from rec.mesh_to_enu, one 4x4 computed in Python
+ * (geo/placement.py) from the same numbers the solver used, and tested there to
+ * reproduce the solver's placement exactly. This function adds only the one
+ * thing Python cannot know: where the ground is (spec 8), sampled once here.
+ *
+ *   modelMatrix = ENU->ECEF (footprint centroid, at ground) x mesh_to_enu
  */
 async function drawBuilding(rec) {
-  const fit = rec.fit;
-  if (!fit) return;
+  const m2e = rec.mesh_to_enu;
+  if (!m2e) {
+    errEl.textContent = 'This record predates mesh_to_enu — re-run pipeline.py for it '
+      + '(add --asset-id to reuse the cached mesh; nothing is re-billed).';
+    return;
+  }
 
-  const [lat, lon] = [rec.enu_origin_geodetic[0], rec.enu_origin_geodetic[1]];
-  const t = fit.transform.translation_m;
-  const scale = fit.transform.scale;
-  const height = rec.height ? rec.height.value_m : 10;
-
-  // The solver's translation is in the ENU frame anchored at the footprint
-  // centroid, so offset the origin by it rather than re-deriving a lat/lon.
-  const enuOrigin = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
-  const enuToFixed = Cesium.Transforms.eastNorthUpToFixedFrame(enuOrigin);
-  const offset = Cesium.Matrix4.multiplyByPoint(
-    enuToFixed, new Cesium.Cartesian3(t[0], t[1], t[2]), new Cesium.Cartesian3(),
+  const [lat, lon] = rec.enu_origin_geodetic;
+  // Spec 8: sample at maximum detail and PIN it; never re-sample on camera moves.
+  const ground = await sampleGround(Cesium.Cartographic.fromDegrees(lon, lat));
+  const enuToFixed = Cesium.Transforms.eastNorthUpToFixedFrame(
+    Cesium.Cartesian3.fromDegrees(lon, lat, ground),
   );
-
-  const carto = Cesium.Cartographic.fromCartesian(offset);
-  const ground = await sampleGround(carto);
-
-  const origin = Cesium.Cartesian3.fromRadians(
-    carto.longitude, carto.latitude, ground,
+  const modelMatrix = Cesium.Matrix4.multiply(
+    enuToFixed, Cesium.Matrix4.fromColumnMajorArray(m2e.column_major), new Cesium.Matrix4(),
   );
-
-  // Spec 2.4. The one place this conversion happens on the JS side.
-  const heading = fit.transform.heading_rad;
-  const hpr = new Cesium.HeadingPitchRoll(heading, 0, 0);
-  const modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(origin, hpr);
 
   const glbUrl = `/assets-data/${rec.asset_id}/mesh.glb`;
-  const hasMesh = (await fetch(glbUrl, { method: 'HEAD' })).ok;
+  const hasMesh = m2e.mesh_frame === 'gltf_scene'
+    && (await fetch(glbUrl, { method: 'HEAD' })).ok;
 
   if (hasMesh) {
-    const model = await Cesium.Model.fromGltfAsync({ url: glbUrl, modelMatrix });
+    // Cesium by default applies TWO rotations to a glTF: Y-up -> Z-up, and a
+    // second one turning glTF's +Z "forward" into +X (ModelUtility.
+    // getAxisCorrectionMatrix). mesh_to_enu already contains the full rotation,
+    // so both must be off: upAxis Z skips the first, forwardAxis X the second.
+    // Leaving the default forwardAxis would twist every building 90 degrees.
+    const model = await Cesium.Model.fromGltfAsync({
+      url: glbUrl,
+      modelMatrix,
+      upAxis: Cesium.Axis.Z,
+      forwardAxis: Cesium.Axis.X,
+    });
     viewer.scene.primitives.add(model);
   } else {
-    // The hour-6 milestone object. If this lands correctly on a real building,
-    // every hard problem is solved and the rest is substitution.
-    const ombb = rec.footprint_ombb_m || [20, 14];
-    viewer.entities.add({
-      name: 'placement box (hour-6 milestone)',
-      position: origin,
-      orientation: Cesium.Transforms.headingPitchRollQuaternion(origin, hpr),
-      box: {
-        dimensions: new Cesium.Cartesian3(
-          ombb[0] * scale[0], ombb[1] * scale[1], height,
-        ),
-        material: Cesium.Color.fromCssColorString('#e8590c').withAlpha(0.7),
-        outline: true,
-        outlineColor: Cesium.Color.fromCssColorString('#7f2704'),
-      },
-    });
+    // The hour-6 milestone object: a unit box, placed by the same matrix.
+    viewer.scene.primitives.add(new Cesium.Primitive({
+      geometryInstances: new Cesium.GeometryInstance({
+        geometry: Cesium.BoxGeometry.fromDimensions({
+          dimensions: new Cesium.Cartesian3(1, 1, 1),
+          vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+        }),
+        modelMatrix,
+        attributes: {
+          color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+            Cesium.Color.fromCssColorString('#e8590c').withAlpha(0.7),
+          ),
+        },
+      }),
+      appearance: new Cesium.PerInstanceColorAppearance({ translucent: true }),
+    }));
   }
 }
 

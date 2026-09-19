@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from contracts import Decision, PlacementRecord  # noqa: E402
-from geo import disambiguate, exif, fit as fitmod, height as heightmod, outline, validate
+from geo import disambiguate, exif, fit as fitmod, height as heightmod, outline, placement, validate
 from geo.coords import ENUFrame
 from geo.footprint import build_footprint, fetch_osm, geocode, select_footprint, to_shapely
 from geo.overlay import render_overlay
@@ -224,8 +224,21 @@ def run(address: str,
         review_reasons=tuple(all_reasons),
     )
 
+    # The matrix the viewer needs: the FitResult alone is defined on canonical
+    # coordinates the viewer cannot reconstruct. Added to the record dict here
+    # rather than to PlacementRecord, which lives in the frozen contract.
+    if mesh_vertices is not None:
+        rot, o, _ = outline.canonical_offsets(mesh_vertices, mo.up_axis_idx)
+        pre, frame_name = placement.mesh_to_canonical(rot, o), "gltf_scene"
+    else:
+        pre, frame_name = placement.unit_box_to_canonical(fp.ombb), "unit_box_centred"
+    m2e = placement.mesh_to_enu(result, pre)
+
+    record_dict = record.to_json_dict()
+    record_dict["mesh_to_enu"] = placement.record_entry(m2e, frame_name)
+
     record_path = run_dir / "record.json"
-    record_path.write_text(json.dumps(record.to_json_dict(), indent=2, default=str),
+    record_path.write_text(json.dumps(record_dict, indent=2, default=str),
                            encoding="utf-8")
     log(f"record: {record_path}")
     log.close()

@@ -201,19 +201,30 @@ def front_angle_canonical(up_axis_idx: int) -> float | None:
     return float(np.arctan2(f[1], f[0]))
 
 
+def canonical_offsets(vertices: np.ndarray, up_axis_idx: int
+                      ) -> tuple[np.ndarray, np.ndarray, float]:
+    """-> (R, o, height_units): canonical = R @ v - o.
+
+    The single definition of the mesh -> canonical frame. canonicalise() applies
+    it, and geo.placement records it so the viewer can reproduce the placement:
+    the solver's transform is defined on CANONICAL coordinates, so a viewer
+    given only that transform and the raw glb cannot place the mesh.
+    """
+    rot = canonical_rotation(up_axis_idx)
+    rotated = np.asarray(vertices, dtype=float) @ rot.T
+    base = robust_base(rotated[:, 2])
+    top = float(np.percentile(rotated[:, 2], 99.0))
+    o = np.array([rotated[:, 0].mean(), rotated[:, 1].mean(), base])
+    return rot, o, max(top - base, 1e-6)
+
+
 def canonicalise(vertices: np.ndarray, up_axis_idx: int) -> tuple[np.ndarray, float]:
     """Rotate so the chosen axis is +Z, drop the base to z=0, centre in XY.
 
     -> (vertices in canonical frame, height in model units)
     """
-    rot = canonical_rotation(up_axis_idx)
-    out = vertices @ rot.T
-    base = robust_base(out[:, 2])
-    top = float(np.percentile(out[:, 2], 99.0))
-    out[:, 2] -= base
-    out[:, 0] -= out[:, 0].mean()
-    out[:, 1] -= out[:, 1].mean()
-    return out, max(top - base, 1e-6)
+    rot, o, height = canonical_offsets(vertices, up_axis_idx)
+    return np.asarray(vertices, dtype=float) @ rot.T - o, height
 
 
 # --------------------------------------------------------------------------
@@ -283,7 +294,16 @@ def ground_outline(vertices_canonical: np.ndarray,
     xy = slab[:, :2]
     # Robust size: ignore the extreme 1% so one stray vertex cannot set the scale.
     size = float(max(np.ptp(np.percentile(xy, [1, 99], axis=0), axis=0).max(), 1e-9))
-    pixel = size / grid_cells
+    # Cell size must track POINT SPACING, not just mesh size. With a fixed
+    # size/300 grid, a sparsely sampled mesh leaves gaps wider than the closing
+    # radius, the plan shatters into fragments, and "keep the largest component"
+    # keeps a sliver (observed: 11% of an L-shaped plan). Cells no smaller than
+    # ~0.75 of the median neighbour spacing keep closing able to fuse neighbours.
+    from scipy.spatial import cKDTree
+    sample = xy if len(xy) <= 5000 else xy[np.random.default_rng(0).choice(len(xy), 5000, replace=False)]
+    nn = cKDTree(sample).query(sample, k=2)[0][:, 1]
+    spacing = float(np.median(nn[nn > 0])) if np.any(nn > 0) else 0.0
+    pixel = max(size / grid_cells, 0.75 * spacing)
     close_px = max(3, int(round(close_frac * grid_cells)))
     open_px = max(3, int(round(open_frac * grid_cells)))
     simplify_eps = simplify_frac * size
