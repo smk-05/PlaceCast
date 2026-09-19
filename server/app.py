@@ -100,7 +100,9 @@ def review_queue() -> list[dict]:
     return queue
 
 
-@app.get("/assets-data/{asset_id}/{filename}")
+# HEAD as well as GET: the viewer checks for mesh.glb with HEAD before loading
+# it. FastAPI's @app.get answers HEAD with 405, which the viewer read as "no mesh".
+@app.api_route("/assets-data/{asset_id}/{filename}", methods=["GET", "HEAD"])
 def asset(asset_id: str, filename: str):
     """Serve overlay.png, mesh.glb, edited_*.png from the run directory."""
     if "/" in filename or ".." in filename or "\\" in filename:

@@ -150,10 +150,17 @@ async function drawBuilding(rec) {
   );
 
   const glbUrl = `/assets-data/${rec.asset_id}/mesh.glb`;
-  const hasMesh = m2e.mesh_frame === 'gltf_scene'
-    && (await fetch(glbUrl, { method: 'HEAD' })).ok;
 
-  if (hasMesh) {
+  if (m2e.mesh_frame === 'gltf_scene') {
+    // A mesh record's matrix is for the MESH. Never fall back to drawing the box
+    // with it: a unit box through a mesh matrix becomes a large, wrong object
+    // that looks like a placement (this happened when the server answered the
+    // HEAD check with 405). If the mesh cannot load, say so.
+    const head = await fetch(glbUrl, { method: 'HEAD' });
+    if (!head.ok) {
+      errEl.textContent = `mesh.glb unavailable (HTTP ${head.status}) — not drawing a substitute.`;
+      return;
+    }
     // Cesium by default applies TWO rotations to a glTF: Y-up -> Z-up, and a
     // second one turning glTF's +Z "forward" into +X (ModelUtility.
     // getAxisCorrectionMatrix). mesh_to_enu already contains the full rotation,
@@ -166,8 +173,8 @@ async function drawBuilding(rec) {
       forwardAxis: Cesium.Axis.X,
     });
     viewer.scene.primitives.add(model);
-  } else {
-    // The hour-6 milestone object: a unit box, placed by the same matrix.
+  } else if (m2e.mesh_frame === 'unit_box_centred') {
+    // Dry run: the hour-6 milestone object, a unit box placed by its own matrix.
     viewer.scene.primitives.add(new Cesium.Primitive({
       geometryInstances: new Cesium.GeometryInstance({
         geometry: Cesium.BoxGeometry.fromDimensions({
@@ -183,6 +190,8 @@ async function drawBuilding(rec) {
       }),
       appearance: new Cesium.PerInstanceColorAppearance({ translucent: true }),
     }));
+  } else {
+    errEl.textContent = `Unknown mesh_frame "${m2e.mesh_frame}" — not drawing anything.`;
   }
 }
 
