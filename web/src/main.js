@@ -100,7 +100,7 @@ async function show(assetId) {
     if (token !== showToken) return;
     rec._ground = ground;
 
-    viewer.entities.removeAll();
+    viewer.entities.removeAll();          // nothing uses entities any more
     viewer.scene.primitives.removeAll();
 
     drawFootprint(rec, ground);
@@ -115,39 +115,71 @@ async function show(assetId) {
   }
 }
 
-/** The authoritative footprint, as ground truth to eyeball the placement against.
+/* EVERYTHING here is drawn as a SYNCHRONOUS Primitive, never as an entity and
+ * never draped on terrain.
  *
- * Drawn at the sampled ground height, NOT draped on the terrain. A
- * classificationType TERRAIN polygon is a ground primitive that Cesium builds
- * asynchronously; switching records removed it mid-build and the renderer died
- * with "DeveloperError: This object was destroyed" — the whole scene stops, and
- * no guard in this file can prevent that, because the destroy happens inside
- * Cesium's own pending build. A polygon at a fixed height is built inline. */
+ * Both of the easy ways to draw a polygon build their geometry on a worker:
+ * classificationType TERRAIN makes a GroundPrimitive, and an entity polygon is
+ * batched by the GeometryVisualizer. Switching records deletes them mid-build
+ * and Cesium's render loop then throws "DeveloperError: This object was
+ * destroyed" and STOPS — permanently, and no guard in this file can catch it,
+ * because the failure is inside Cesium's own pending job. `asynchronous: false`
+ * builds the geometry inline, so a removed primitive has no pending work left.
+ */
+function polygonHierarchy(rings) {
+  return new Cesium.PolygonHierarchy(
+    Cesium.Cartesian3.fromDegreesArray(rings[0].flatMap(([lon, lat]) => [lon, lat])),
+    rings.slice(1).map(
+      (r) => new Cesium.PolygonHierarchy(
+        Cesium.Cartesian3.fromDegreesArray(r.flatMap(([lon, lat]) => [lon, lat])),
+      ),
+    ),
+  );
+}
+
+function addPolygon(rings, { height, extrudedHeight, colour, outlineColour }) {
+  const hierarchy = polygonHierarchy(rings);
+  const common = { polygonHierarchy: hierarchy, height, extrudedHeight };
+  viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: new Cesium.GeometryInstance({
+      geometry: new Cesium.PolygonGeometry({
+        ...common,
+        vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+      }),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(colour),
+      },
+    }),
+    appearance: new Cesium.PerInstanceColorAppearance({ translucent: colour.alpha < 1 }),
+    asynchronous: false,
+  }));
+  if (!outlineColour) return;
+  viewer.scene.primitives.add(new Cesium.Primitive({
+    geometryInstances: new Cesium.GeometryInstance({
+      geometry: new Cesium.PolygonOutlineGeometry(common),
+      attributes: {
+        color: Cesium.ColorGeometryInstanceAttribute.fromColor(outlineColour),
+      },
+    }),
+    appearance: new Cesium.PerInstanceColorAppearance({
+      flat: true, translucent: false, renderState: { lineWidth: 2 },
+    }),
+    asynchronous: false,
+  }));
+}
+
+/** The authoritative footprint, as ground truth to eyeball the placement against. */
 function drawFootprint(rec, ground) {
   const geom = rec.footprint_geojson;
   if (!geom || !geom.coordinates) return;
-
-  const rings = geom.type === 'Polygon' ? geom.coordinates : geom.coordinates[0];
-  const outer = rings[0].flatMap(([lon, lat]) => [lon, lat]);
-
-  viewer.entities.add({
-    name: 'authoritative footprint',
-    polygon: {
-      hierarchy: new Cesium.PolygonHierarchy(
-        Cesium.Cartesian3.fromDegreesArray(outer),
-        rings.slice(1).map(
-          (r) => new Cesium.PolygonHierarchy(
-            Cesium.Cartesian3.fromDegreesArray(r.flatMap(([lon, lat]) => [lon, lat])),
-          ),
-        ),
-      ),
-      material: Cesium.Color.fromCssColorString('#1b6ca8').withAlpha(0.35),
-      outline: true,
-      outlineColor: Cesium.Color.fromCssColorString('#1b6ca8'),
-      perPositionHeight: false,
-      height: ground + 0.2,   // just clear of the terrain, no z-fighting
-    },
-  });
+  const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
+  for (const rings of polys) {
+    addPolygon(rings, {
+      height: ground + 0.2,              // clear of the terrain, no z-fighting
+      colour: Cesium.Color.fromCssColorString('#1b6ca8').withAlpha(0.35),
+      outlineColour: Cesium.Color.fromCssColorString('#1b6ca8'),
+    });
+  }
 }
 
 /**
@@ -232,24 +264,11 @@ function drawFootprintPrism(rec, ground) {
   // Every ring, so courtyards stay holes and Lane Stadium keeps its stands.
   const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
   for (const rings of polys) {
-    viewer.entities.add({
-      name: 'footprint prism',
-      polygon: {
-        hierarchy: new Cesium.PolygonHierarchy(
-          Cesium.Cartesian3.fromDegreesArray(rings[0].flatMap(([lon, lat]) => [lon, lat])),
-          rings.slice(1).map(
-            (r) => new Cesium.PolygonHierarchy(
-              Cesium.Cartesian3.fromDegreesArray(r.flatMap(([lon, lat]) => [lon, lat])),
-            ),
-          ),
-        ),
-        perPositionHeight: false,
-        height: ground,                       // pinned terrain, as for a mesh
-        extrudedHeight: ground + height,
-        material: Cesium.Color.fromCssColorString('#c9a227').withAlpha(0.85),
-        outline: true,
-        outlineColor: Cesium.Color.fromCssColorString('#5c4708'),
-      },
+    addPolygon(rings, {
+      height: ground,                        // pinned terrain, as for a mesh
+      extrudedHeight: ground + height,
+      colour: Cesium.Color.fromCssColorString('#c9a227').withAlpha(0.85),
+      outlineColour: Cesium.Color.fromCssColorString('#5c4708'),
     });
   }
 }
