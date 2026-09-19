@@ -24,7 +24,7 @@ from pathlib import Path
 
 import requests
 
-MODEL = "firtoz/trellis"
+MODEL = "firtoz/trellis:45606f9ae85f52cce622be1c47aa753c5079fc3463ec1b43f60a624962f81321"
 
 # Replicate deployment defaults, recorded in the placement record so the result
 # is reproducible (spec 12.1).
@@ -36,6 +36,8 @@ DEFAULT_PARAMS = {
     "mesh_simplify": 0.95,      # quadric simplification retention
     "texture_size": 1024,       # 2048 only for hero assets (spec 13.3)
     "generate_model": True,
+    "randomize_seed": False,
+    "generate_color": False,
 }
 
 
@@ -61,10 +63,7 @@ def lift_to_mesh(image_paths: list[Path], out_path: Path,
     handles = [open(p, "rb") for p in image_paths]
     try:
         payload = {**merged}
-        if len(handles) == 1:
-            payload["images"] = [handles[0]]
-        else:
-            payload["images"] = handles
+        payload["image"] = handles[0]   # this TRELLIS version is single-view only
         output = replicate.run(MODEL, input=payload)
     finally:
         for h in handles:
