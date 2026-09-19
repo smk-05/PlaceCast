@@ -1,9 +1,18 @@
 #!/usr/bin/env python
 """Building mask from a photo (ML_ADDENDUM A.3, stage 1).
 
-    Grounding DINO ("building. house. facade.") -> box -> SAM 2 -> clean() -> PNG
+    Grounding DINO ("building. house. facade.") -> box -> SAM 2 -> clean_components() -> PNG
 
-Usage:
+Pipeline API (contracts.SegmentBuilding; what pipeline.py imports):
+    segment_building(path) -> (mask HxW bool, mask_area_frac, occluded)
+    clean(mask, close_px=5) -> mask            largest + big-enough components, close, fill holes
+    assess_mask(mask)       -> (area_frac, occluded, note)     A.4 failure detection
+
+segment_building runs the REAL models by default (PROCEDURA_PERCEPTION=real). Set PROCEDURA_PERCEPTION=stub
+(or pass backend="stub") for the non-ML central-box stand-in, which needs no GPU and no torch; see
+perception/backend.py. Real segmentation raises SegmentationError rather than falling back to the stand-in.
+
+Command line:
     python perception/segment.py PHOTO.jpg [-o OUT.png] [--force]
 
 Output is a single-channel PNG the size of the *EXIF-upright* photo (EXIF
@@ -11,10 +20,10 @@ orientation is applied before anything else, so the mask lines up with what a
 person sees): 255 = building, 0 = background. Whoever consumes the mask must
 use the same convention (PIL.ImageOps.exif_transpose).
 
-clean() keeps the largest component plus big-enough components inside the detection box.
+clean_components() keeps the largest component plus big-enough components inside the detection box.
 
 Masks are cached in cache/masks/ keyed by the SHA-256 of the image bytes (plus a
-short hash of the settings below, so changing the prompt/models/clean() params
+short hash of the settings below, so changing the prompt/models/clean_components() params
 never returns a stale mask). A sidecar .json records every intermediate choice.
 A cache hit does not import torch or load any model.
 
@@ -33,9 +42,15 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps
+from scipy import ndimage
 
 ROOT = Path(__file__).resolve().parent.parent
-CACHE_DIR = ROOT / "cache" / "masks"
+if str(ROOT) not in sys.path:  # `python perception/segment.py` puts perception/ first, not the repo root
+    sys.path.insert(0, str(ROOT))
+
+from perception.backend import STUB, resolve_backend  # noqa: E402
+
+CACHE_DIR = ROOT / ".cache" / "perception" / "masks"  # .cache/ is gitignored
 DEFAULT_OUT_DIR = ROOT / "outputs" / "masks"
 
 PROMPT = "building. house. facade."
@@ -50,6 +65,10 @@ MAX_FRAME_COVERAGE = 0.90  # A.4: mask covering >90% of the frame is the wrong t
 CENTRE_BOX_FRACTION = 0.80  # A.2/A.4 re-prompt: central 80% box + centre click
 MERGE_MIN_FRACTION = 0.10  # clean(): also keep components >= 10% of the largest (if inside the DINO box)
 DISCARDED_WARN_FRACTION = 0.15  # diagnostic only (not in the cache key): warn above this
+
+# A.4 detection thresholds for assess_mask(), applied to a mask whatever produced it.
+MIN_AREA_FRAC = 0.04  # tiny mask -> occluded or wrong object
+STUB_CENTRAL_BOX_FRAC = 0.80  # the stand-in's box (A.2 fallback)
 
 
 class SegmentationError(Exception):
@@ -91,12 +110,12 @@ def cache_write(png_path, json_path, mask, meta):
 # ------------------------------------------------------------------ clean()
 
 
-def clean(mask, dino_box, close_px=CLOSE_KERNEL_PX, merge_min_fraction=MERGE_MIN_FRACTION):
+def clean_components(mask, dino_box=None, close_px=CLOSE_KERNEL_PX, merge_min_fraction=MERGE_MIN_FRACTION):
     """A.3 clean(), extended to survive occluders.
 
     Keeps the largest connected component plus every component that is at least
     `merge_min_fraction` of the largest AND whose bounding box overlaps `dino_box`
-    (the Grounding DINO detection), so parts of one building split by a tree or
+    (the Grounding DINO detection; None = the whole image, for an already-cleaned mask), so parts of one building split by a tree or
     pole are kept while neighbouring structures outside the detection are not.
     Then a morphological close over the kept set and interior hole fill.
 
@@ -118,7 +137,7 @@ def clean(mask, dino_box, close_px=CLOSE_KERNEL_PX, merge_min_fraction=MERGE_MIN
         return np.zeros(m.shape, dtype=bool), stats
     areas = cc[:, cv2.CC_STAT_AREA]
     largest = 1 + int(np.argmax(areas[1:]))
-    bx0, by0, bx1, by1 = dino_box
+    bx0, by0, bx1, by1 = (0, 0, m.shape[1], m.shape[0]) if dino_box is None else dino_box
     keep = [largest]
     for i in range(1, n):
         if i == largest:
@@ -133,6 +152,34 @@ def clean(mask, dino_box, close_px=CLOSE_KERNEL_PX, merge_min_fraction=MERGE_MIN
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (close_px, close_px)))
     # Holes reachable from the image border are background, not windows, and stay open.
     return ndimage.binary_fill_holes(m), stats
+
+
+def clean(mask, close_px=CLOSE_KERNEL_PX):
+    """The pipeline's clean(mask) -> mask. No detection box exists here, so this keeps every component that is at
+    least MERGE_MIN_FRACTION of the largest. It is unchanged by a second application, which matters because
+    pipeline.py calls it on segment_building()'s output, which is already clean_components()-ed: a
+    largest-component-only clean here would throw the merged occlusion-split parts away again."""
+    return clean_components(mask, None, close_px)[0]
+
+
+def assess_mask(mask):
+    """A.4 failure detection on any mask, whatever produced it. -> (area_frac, occluded, note)."""
+    mask = np.asarray(mask, dtype=bool)
+    frac = float(mask.mean())
+    if frac > MAX_FRAME_COVERAGE:
+        return frac, True, "mask covers >90% of frame - segmented the streetscape"
+    if frac < MIN_AREA_FRAC:
+        return frac, True, "mask tiny relative to frame - occluded or wrong object"
+    edges = int(mask[0].any()) + int(mask[-1].any()) + int(mask[:, 0].any()) + int(mask[:, -1].any())
+    if edges > MAX_EDGES_TOUCHED:
+        return frac, True, "mask touches >3 image edges"
+    # High boundary complexity relative to area indicates tree/vehicle occlusion chewing holes in the silhouette.
+    filled = ndimage.binary_fill_holes(mask).astype(int)
+    perimeter = float(np.abs(np.diff(filled, axis=0)).sum() + np.abs(np.diff(filled, axis=1)).sum())
+    complexity = perimeter / np.sqrt(max(float(filled.sum()), 1.0))
+    if complexity > 12.0:
+        return frac, True, f"boundary complexity {complexity:.1f} - likely occlusion"
+    return frac, False, ""
 
 
 def mask_problems(mask):
@@ -256,7 +303,7 @@ def segment_image(image):
                 m = (1 - CENTRE_BOX_FRACTION) / 2
                 box = [width * m, height * m, width * (1 - m), height * (1 - m)]
                 point, prompt_used = (width / 2, height / 2), "centre_box_retry"
-            mask, clean_stats = clean(segment(box, point), chosen["box"])
+            mask, clean_stats = clean_components(segment(box, point), chosen["box"])
             problems = mask_problems(mask)
             attempts.append(
                 {"prompt": prompt_used, "box": [round(v, 1) for v in box], "problems": problems, **clean_stats}
@@ -274,7 +321,7 @@ def segment_image(image):
     # The merge-vs-discard tradeoff of clean(): a high discarded share means SAM's mask had large
     # pieces that were small, or outside the detection box, so the silhouette may be a fragment (A.4).
     if clean_stats["discarded_area_frac"] > DISCARDED_WARN_FRACTION:
-        log(f"  WARNING clean() discarded {clean_stats['discarded_area_frac']:.0%} of SAM's mask "
+        log(f"  WARNING clean_components() discarded {clean_stats['discarded_area_frac']:.0%} of SAM's mask "
             f"(kept {clean_stats['components_merged'] + 1} of {clean_stats['components_total']} components); inspect the mask")
     meta = {
         "prompt": PROMPT,
@@ -298,7 +345,8 @@ def segment_image(image):
     return mask, meta
 
 
-def run(photo, out_path, force=False):
+def segment_file(photo, force=False):
+    """Real segmentation of one file, cached by image hash. -> (bool mask, sidecar metadata, cached PNG path)."""
     photo = Path(photo)
     if not photo.is_file():
         raise SegmentationError(f"no such file: {photo}")
@@ -316,10 +364,41 @@ def run(photo, out_path, force=False):
         meta["image_sha256"] = sha
         meta["source_name"] = photo.name
         cache_write(png_path, json_path, mask, meta)
+    return np.array(Image.open(png_path)) > 0, json.loads(json_path.read_text(encoding="utf-8")), png_path
+
+
+def run(photo, out_path, force=False):
+    _, meta, png_path = segment_file(photo, force=force)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(png_path, out_path)
-    return out_path, json.loads(json_path.read_text(encoding="utf-8"))
+    return out_path, meta
+
+
+def _segment_building_stub(image_path):
+    """Non-ML stand-in: the photo is OF a building, so the central 80% box is the mask (A.2's own fallback)."""
+    with Image.open(image_path) as im:
+        w, h = im.size
+    mask = np.zeros((h, w), dtype=bool)
+    mx, my = int(w * (1.0 - STUB_CENTRAL_BOX_FRAC) / 2.0), int(h * (1.0 - STUB_CENTRAL_BOX_FRAC) / 2.0)
+    mask[my : h - my, mx : w - mx] = True
+    return mask, float(mask.mean()), False
+
+
+def segment_building(image_path, *, backend=None):
+    """contracts.SegmentBuilding: -> (binary HxW mask, mask_area_frac, occluded).
+
+    Real (default): Grounding DINO + SAM 2 via segment_file(); raises SegmentationError on failure.
+    `occluded` is True when clean_components() discarded more than DISCARDED_WARN_FRACTION of SAM's mask (the
+    building was split by an occluder) or assess_mask() flags the result. NOTE pipeline.py currently discards this
+    flag (`mask, _, _ = segment_building(...)`) and recomputes occlusion from the mask alone.
+    Stub: the central-box mask; needs no GPU.
+    """
+    if resolve_backend(backend) == STUB:
+        return _segment_building_stub(image_path)
+    mask, meta, _ = segment_file(image_path)
+    frac, occluded_by_mask, _ = assess_mask(mask)
+    return mask, frac, bool(occluded_by_mask or meta["discarded_area_frac"] > DISCARDED_WARN_FRACTION)
 
 
 def main():

@@ -1,15 +1,11 @@
 """Feature vector for the learned confidence gate (ML_ADDENDUM B.3).
 
-    x = feature_vector(fit, photo, fp, geocode_rooftop=..., height_source_authoritative=...)
+    x = feature_vector(fit, photo, fp)
 
-Inputs are duck-typed (contracts.py is frozen and shared): `fit` needs iou, hausdorff_m, area_ratio,
-rotation_margin_footprint, anisotropy_log_ratio, max_neighbor_overlap; `photo` needs
-silhouette_margin; `fp` needs rectilinearity. Nothing is defaulted: a missing attribute raises
-AttributeError, and a non-finite value or a non-positive area ratio raises ValueError.
-
-The two binary features are NOT in FitResult / PhotoEvidence / Footprint (F.1), so they are
-required keyword arguments. `score_confidence(fit, photo, fp)` as written in F.1 has no way to
-supply them; that signature needs a contract decision before gate.py can call this.
+Inputs are the three contracts.py objects and nothing else: everything B.3 asks for is on them
+(contracts.py v1.0 added `Footprint.geocode_rooftop` and `FitResult.height_source_authoritative` for
+exactly this). Nothing is defaulted: a missing attribute raises AttributeError, and a non-finite value or
+a non-positive area ratio raises ValueError.
 
 Feature table (B.3), with the expected sign the fitted coefficient is compared against:
 
@@ -21,12 +17,17 @@ Feature table (B.3), with the expected sign the fitted coefficient is compared a
   rectilinearity               +   fp.rectilinearity                        SPEC 4.2
   abs_anisotropy_log_ratio     -   |fit.anisotropy_log_ratio|               SPEC 6.9
   max_neighbor_overlap         -   fit.max_neighbor_overlap                 SPEC 9.2
-  geocode_rooftop              +   caller (Google location_type == ROOFTOP) SPEC 3.1
-  height_source_authoritative  +   caller (OSM height / levels tag)         SPEC 7
+  geocode_rooftop              +   fp.geocode_rooftop                        SPEC 3.1
+  height_source_authoritative  +   fit.height_source_authoritative          SPEC 7 (OSM tags only)
 
 The table's `area_ratio_log` is used as |log(ratio)|: log makes it symmetric about 1 (0.5x and 2x
 are equally wrong) and the "||.|| -" sign means the magnitude is what hurts, which a linear model
 can only express on the absolute value. The same goes for the sign-arbitrary anisotropy log-ratio.
+
+Deliberately NOT features: footprint match quality (`fp.is_weak_match`), multi-part footprints,
+mirrored fits and `fit.exif_silhouette_disagree` are hard rules in confidence/gate.py. They are rare and
+categorical, a 10-feature model on ~100 rows cannot learn them, and a wrong-building match must never
+depend on a fitted coefficient.
 """
 from __future__ import annotations
 
@@ -73,13 +74,7 @@ def _finite(name, value):
     return value
 
 
-def _binary(name, value):
-    if isinstance(value, (bool, np.bool_)) or (isinstance(value, (int, np.integer)) and value in (0, 1)):
-        return float(bool(value))
-    raise ValueError(f"feature {name} must be a bool (or 0/1), got {value!r}")
-
-
-def feature_dict(fit, photo, fp, *, geocode_rooftop, height_source_authoritative):
+def feature_dict(fit, photo, fp):
     """All ten B.3 features, by name."""
     area_ratio = _finite("area_ratio", fit.area_ratio)
     if area_ratio <= 0:
@@ -93,8 +88,8 @@ def feature_dict(fit, photo, fp, *, geocode_rooftop, height_source_authoritative
         "rectilinearity": _finite("rectilinearity", fp.rectilinearity),
         "abs_anisotropy_log_ratio": abs(_finite("anisotropy_log_ratio", fit.anisotropy_log_ratio)),
         "max_neighbor_overlap": _finite("max_neighbor_overlap", fit.max_neighbor_overlap),
-        "geocode_rooftop": _binary("geocode_rooftop", geocode_rooftop),
-        "height_source_authoritative": _binary("height_source_authoritative", height_source_authoritative),
+        "geocode_rooftop": float(bool(fp.geocode_rooftop)),
+        "height_source_authoritative": float(bool(fit.height_source_authoritative)),
     }
 
 
@@ -105,23 +100,12 @@ def _select(values, names):
     return np.array([values[n] for n in names], dtype=float)
 
 
-def feature_vector(fit, photo, fp, *, geocode_rooftop, height_source_authoritative, names=FEATURE_NAMES):
+def feature_vector(fit, photo, fp, *, names=FEATURE_NAMES):
     """Features as a 1-D float array in `names` order."""
-    return _select(
-        feature_dict(fit, photo, fp, geocode_rooftop=geocode_rooftop, height_source_authoritative=height_source_authoritative),
-        names,
-    )
+    return _select(feature_dict(fit, photo, fp), names)
 
 
 def feature_matrix(rows, names=FEATURE_NAMES):
     """(n_rows, len(names)) matrix from labelled rows exposing .fit .photo .footprint
-    .geocode_rooftop .height_source_authoritative (e.g. fixtures.fake_fits.LabelledFit)."""
-    return np.vstack(
-        [
-            feature_vector(
-                r.fit, r.photo, r.footprint,
-                geocode_rooftop=r.geocode_rooftop, height_source_authoritative=r.height_source_authoritative, names=names,
-            )
-            for r in rows
-        ]
-    )
+    (e.g. fixtures.fake_fits.LabelledFit)."""
+    return np.vstack([feature_vector(r.fit, r.photo, r.footprint, names=names) for r in rows])

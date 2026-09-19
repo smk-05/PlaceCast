@@ -4,6 +4,18 @@
     result = render_compare(mesh, mask)            # trimesh mesh + mask PNG path or bool array
     result.best, result.second, result.margin, result.candidates
 
+Pipeline API (contracts.ScoreSilhouettes; what the smoke test and pipeline import):
+    score_silhouettes(mesh, mask, [CandidateId]) -> {CandidateId: normalised IoU}
+    margin_of(scores)                            -> top-two gap
+    photographed_side(mesh, mask)                -> which side of the mesh the photo shows
+
+score_silhouettes scores the UP-AXIS and is deliberately flat across azimuth_k: k is a rotation of the
+PLACED mesh about the vertical, and the pipeline assumes the photographed facade is the mesh front, so
+the silhouette cannot depend on k. Scoring by mesh side and passing those scores to geo as placement
+candidates makes silhouette "decide" k=0 for every photo (tests/test_azimuth_contract.py). The
+side-of-mesh answer is photographed_side(), for correcting MeshOutline.front_angle. PROCEDURA_PERCEPTION=stub
+returns the abstaining stand-in (see perception/backend.py).
+
 The mesh is rendered as an orthographic *silhouette* from every candidate
 (up-axis x 4 azimuths) and each silhouette is scored against the photo's building
 mask by normalised-shape IoU: both shapes are cropped to their bounding box,
@@ -48,6 +60,12 @@ import cv2
 import numpy as np
 import trimesh
 from PIL import Image
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:  # `python perception/render_compare.py` puts perception/ first, not the repo root
+    sys.path.insert(0, str(ROOT))
+
+from perception.backend import STUB, resolve_backend  # noqa: E402
 
 CANVAS_PX = 128
 PAD_PX = 2
@@ -213,6 +231,63 @@ def render_compare(mesh, mask, up_axes=None, theta0=0.0, size=CANVAS_PX, footpri
         ranked, best, second, margin, ties,
         label=symmetry_label(margin, footprint_aspect), needs_review=margin < REVIEW_MARGIN,
     )
+
+
+# ------------------------------------------------------------ contracts adapters
+
+# The six signed up-axes, in the order CandidateId.up_axis_idx indexes them (contracts.py, and
+# geo.outline.UP_AXIS_CANDIDATES; tests/test_azimuth_contract.py asserts they agree). Duplicated rather
+# than imported: perception must not import geo/.
+UP_AXIS_CANDIDATES = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+
+
+@dataclass(frozen=True)
+class PhotographedSide:
+    """Which side of the mesh the photo shows: camera azimuth 90 * index degrees, CCW from the mesh front seen
+    from above (the canonical-frame angle MeshOutline.front_angle + 90 * index deg)."""
+
+    index: int  # 0..3
+    score: float
+    margin: float  # best minus second-best side; ~0 when the silhouette cannot tell (a symmetric mesh)
+    scores: tuple
+
+
+def side_scores(mesh, mask, up_axis=(0, 1, 0), size=CANVAS_PX):
+    """Normalised IoU of the mask against the mesh seen from each of its four sides (camera azimuth 0, 90, 180,
+    270 about `up_axis`; 0 is the mesh front)."""
+    mesh, target = _as_mesh(mesh), normalise_mask(_as_mask(mask), size)
+    return tuple(normalised_iou(render_silhouette(mesh, up_axis, k * np.pi / 2, size), target) for k in range(4))
+
+
+def photographed_side(mesh, mask, up_axis=(0, 1, 0), size=CANVAS_PX):
+    scores = side_scores(mesh, mask, up_axis, size)
+    order = sorted(range(4), key=lambda k: -scores[k])  # stable: ties keep the lower index
+    return PhotographedSide(order[0], scores[order[0]], scores[order[0]] - scores[order[1]], scores)
+
+
+def margin_of(scores):
+    """Top-two gap of a {CandidateId: score} dict; 0.0 with fewer than two entries. Addendum A.3 feeds this to
+    the confidence gate; keep it separate from the footprint-IoU margin in FitResult."""
+    top = sorted(scores.values(), reverse=True)
+    return float(top[0] - top[1]) if len(top) > 1 else 0.0
+
+
+def score_silhouettes(mesh, mask, candidates, *, backend=None, size=CANVAS_PX):
+    """contracts.ScoreSilhouettes: normalised silhouette IoU per CandidateId(up_axis_idx, azimuth_k).
+
+    Depends on the up-axis only and is flat across azimuth_k (see the module docstring): margin_of() is 0 for
+    candidates that share an up-axis, so PhotoEvidence.has_silhouette_evidence is False and geo.disambiguate
+    abstains on this cue, which is correct. A None mesh, or the stub backend, abstains for every candidate.
+    """
+    if mesh is None or resolve_backend(backend) == STUB:
+        return {c: 0.5 for c in candidates}
+    mesh, target = _as_mesh(mesh), normalise_mask(_as_mask(mask), size)
+    by_up = {}
+    for c in candidates:
+        if c.up_axis_idx not in by_up:
+            axis = UP_AXIS_CANDIDATES[c.up_axis_idx]
+            by_up[c.up_axis_idx] = normalised_iou(render_silhouette(mesh, axis, 0.0, size), target)
+    return {c: by_up[c.up_axis_idx] for c in candidates}
 
 
 def main():

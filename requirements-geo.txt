@@ -1,0 +1,25 @@
+# Geometry / math half — CPU only. No torch, no CUDA, no OpenGL.
+# Install:  uv venv --python 3.11 ; uv pip install -r requirements-geo.txt
+
+numpy>=1.26,<2.2
+scipy>=1.13                     # Delaunay (alpha-shapes), Nelder-Mead/Powell (6.8)
+shapely>=2.0                    # ring-aware ops + STRtree; 3.3 requires ring awareness
+pyproj>=3.6                     # ECEF/ENU cross-check + geoid fallback (2.2, 2.3)
+trimesh>=4.4
+networkx>=3.2                   # trimesh soft dep for mesh graph ops
+scikit-image>=0.24              # marching squares (6.3), morphology, polygon raster
+opencv-python-headless>=4.10    # minAreaRect (4.4). headless = no Qt conflict
+matplotlib>=3.9                 # the 9.3 overlay PNG
+pillow>=10.3                    # image I/O + EXIF (6.6 Filter 2)
+requests>=2.32                  # Overpass, Nominatim
+python-dotenv>=1.0
+replicate>=0.32                 # section 5 generation
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pytest>=8.2
+
+# Deliberately NOT here:
+#   pyrender / any OpenGL — offscreen GL on Windows has no OSMesa and no EGL.
+#     Section 6.3's top-down occupancy grid is trimesh + numpy + skimage.draw.polygon.
+#   torch / transformers   — perception runs on the other machine.
+#   geopandas / buildingregulariser — only for 4.3 regularisation. Add if needed.

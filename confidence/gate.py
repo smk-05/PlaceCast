@@ -1,13 +1,18 @@
 """Confidence gate: SPEC 9.1 threshold table (default) with the learned model behind a flag (ML_ADDENDUM B.4).
 
-    probability, decision = score_confidence(fit, photo, fp)            # ML_ADDENDUM F.1 signature
-    result = evaluate_gate(fit, photo, fp, ...)                          # the inspectable version
+    score, decision = score_confidence(fit, photo, fp, method=None)            # contracts.ScoreConfidence
+    score, decision, reasons = score_confidence_verbose(fit, photo, fp, ...)   # what pipeline.py calls
+    result = evaluate_gate(fit, photo, fp, ...)                                 # the inspectable version
 
-decision is one of "auto_accept", "review", "reject".
+`decision` is a contracts.Decision. `method` is "threshold_table" (default) or "learned"; these are the
+strings PlacementRecord.confidence_method and the pipeline's --confidence flag already use. With
+method=None the environment picks: PROCEDURA_LEARNED_GATE=1 means "learned", otherwise the table. An explicit
+`method=` always wins over the environment.
 
-The table is the default and works standalone: pure Python, no numpy / scikit-learn, no model file, no
-training. It never returns a probability (the table has none; probability is NaN from score_confidence,
-None on the result), because a made-up number would look like evidence.
+The table works with no trained model and no ML stack: it needs only contracts.py (which imports numpy).
+It never invents a probability: GateDecision.probability is None. The float that score_confidence returns on
+the table path is a crude monotone `pseudo_score` for ordering and logging, NOT a calibrated probability
+(pipeline.py writes it into record.json, which cannot hold NaN).
 
 Table (SPEC 9.1). Each metric lands in a band; the decision is the WORST band across metrics, so a fit
 auto-accepts only if every metric does, and IoU and Hausdorff must both pass:
@@ -20,25 +25,31 @@ auto-accepts only if every metric does, and IoU and Hausdorff must both pass:
   anisotropy |log(sx/sy)|  accept <= 0.05    review 0.05-0.15   reject >= 0.15
   neighbour overlap        accept <= 0.02    review 0.02-0.10   reject > 0.10
 
-Boundaries follow the spec's symbols (>= / <= belong to accept; a value equal to a review/reject edge
-takes the milder band, except anisotropy 0.15 which the spec rejects). The spec leaves 0.14-0.15 of
-anisotropy unassigned; it is review, since reject starts at 0.15. Metrics must be finite: NaN would
-compare False against every edge and silently pick a band, so it raises.
+Boundaries follow the spec's symbols (>= / <= belong to accept; a value equal to a review/reject edge takes the
+milder band, except anisotropy 0.15 which the spec rejects). The spec leaves 0.14-0.15 of anisotropy
+unassigned; it is review, since reject starts at 0.15. Metrics must be finite: NaN would compare False
+against every edge and silently pick a band, so it raises. These numbers duplicate geo.validate.THRESHOLDS on
+purpose (this module must not import geo/); tests/test_gate.py asserts the two agree.
 
-Learned model (B.4): a second code path, selected by PROCEDURA_LEARNED_GATE=1 or use_learned=True. It
-reads the model.json written by confidence/train.py: p >= p_accept -> auto_accept, p <= p_reject ->
-reject, else review; a threshold that training could not set (None) is never applied, so a model that
-cannot reach the precision target never auto-accepts. If the flag is on and the model is missing,
-malformed, or trained on synthetic data, this RAISES: silently using the table would leave someone
-believing the learned gate is live. To fall back, unset the flag. The learned path needs the two
-binaries geocode_rooftop / height_source_authoritative when the model uses them (they are not in
-the F.1 objects). The table's own decision is always computed and returned as `table_decision`, so
-disagreements between model and table can be reported as findings (B.4).
+Hard rules, applied on BOTH methods. Each sets a floor under the decision; they never lower it:
+  reject  the fit is a reflection (fit.is_mirrored, SPEC 1.2 / 6.8 / 10.2 #5): rejected, never accepted
+  review  orientation was guessed: fit.disambiguated_by is ROAD_NORMAL, FACADE_DETAIL or ARBITRARY_SYMMETRIC
+          (A.3 / A.4: flag regardless of IoU; both ROAD_NORMAL and FACADE_DETAIL come from the street-facing prior)
+  review  round or organic building (fp.is_ill_posed, R < 0.6; SPEC 10.2 #8): rotation is meaningless
+  review  footprint matched on thin evidence (fp.match_quality is "unnamed_sole_candidate" or unrecorded): a
+          high IoU against the WRONG building is the most dangerous output this pipeline can produce
+  review  multi-part footprint (fp.is_multipart): the OMBB and rotation come from the largest part only
+  review  EXIF and the silhouette picked different candidates (fit.exif_silhouette_disagree is True)
 
-Hard rules, applied on BOTH paths (they can only turn auto_accept into review, never upgrade):
-  * orientation was guessed (fit.disambiguated_by in road_normal / arbitrary_symmetric / unresolved):
-    A.3 and A.4 say flag for review regardless of IoU.
-  * rectilinearity < 0.6 (SPEC 10.2 #8): round or organic building, rotation is meaningless.
+Learned model (B.4): reads the model.json written by confidence/train.py: p >= p_accept -> auto_accept,
+p <= p_reject -> reject, else review; a threshold that training could not set (None) is never applied, so a
+model that cannot reach the precision target never auto-accepts. If the model FILE is absent the gate falls
+back to the table and says so: `method` on the result is "threshold_table", `fallback_reason` names the
+missing path, and the reason is the first review reason. Anything else wrong with a model that IS there
+(malformed, trained on synthetic data, mismatched features) raises: that is a bug or a mistake, not an
+absence, and hiding it behind the table would leave someone believing the learned gate is live. The table's
+own decision is always computed and returned as `table_decision`; when the model disagrees a
+"DISAGREEMENT" reason records both (B.4: that disagreement is the finding, not a bug).
 """
 from __future__ import annotations
 
@@ -48,19 +59,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from contracts import Decision, Disambiguator
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
-AUTO_ACCEPT, REVIEW, REJECT = "auto_accept", "review", "reject"
+AUTO_ACCEPT, REVIEW, REJECT = Decision.AUTO_ACCEPT, Decision.REVIEW, Decision.REJECT
 _RANK = {AUTO_ACCEPT: 0, REVIEW: 1, REJECT: 2}
 
+METHOD_TABLE, METHOD_LEARNED = "threshold_table", "learned"
+METHODS = (METHOD_TABLE, METHOD_LEARNED)
 ENV_FLAG = "PROCEDURA_LEARNED_GATE"
 ENV_MODEL = "PROCEDURA_GATE_MODEL"
 DEFAULT_MODEL_PATH = ROOT / "outputs" / "confidence" / "model.json"
 _TRUE, _FALSE = {"1", "true", "yes", "on"}, {"", "0", "false", "no", "off"}
 
-GUESSED_ORIENTATION = frozenset({"road_normal", "arbitrary_symmetric", "unresolved"})
-ROUND_BUILDING_RECTILINEARITY = 0.6
+GUESSED_ORIENTATION = frozenset({Disambiguator.ROAD_NORMAL, Disambiguator.FACADE_DETAIL, Disambiguator.ARBITRARY_SYMMETRIC})
 
 
 # ---------------------------------------------------------------- data types
@@ -70,19 +84,22 @@ ROUND_BUILDING_RECTILINEARITY = 0.6
 class MetricCheck:
     name: str
     value: float
-    band: str  # auto_accept | review | reject
+    band: Decision
     rule: str  # the table row, for the review payload (SPEC 9.3)
 
 
 @dataclass(frozen=True)
 class GateDecision:
-    decision: str
-    probability: Optional[float]  # None on the table path
-    path: str  # "table" | "learned"
-    table_decision: str  # what the SPEC 9.1 table says, whichever path decided
+    decision: Decision
+    probability: Optional[float]  # the learned model's p; None on the table path
+    score: float  # what score_confidence returns: p when learned, else the table's pseudo_score
+    method: str  # the method that RAN (may differ from `requested_method` on a fallback)
+    requested_method: str
+    fallback_reason: Optional[str]  # set when "learned" was requested but the table ran
+    table_decision: Decision  # what the SPEC 9.1 table says, whichever method decided
     checks: tuple  # every table metric with its band (always computed)
-    reasons: tuple  # why the decision is not a clean auto_accept
-    forced_review: tuple  # hard rules that fired
+    reasons: tuple  # why the decision is not a clean auto_accept, most important first
+    forced: tuple  # the hard rules that fired, as (floor Decision, reason)
 
 
 # ------------------------------------------------------------------ the table
@@ -156,17 +173,45 @@ def table_checks(fit, fp):
     return tuple(MetricCheck(name, values[name], band(values[name]), rule) for name, band, rule in TABLE)
 
 
-def worst(bands):
-    return max(bands, key=_RANK.__getitem__)
+def worst(decisions):
+    return max(decisions, key=_RANK.__getitem__)
 
 
-def hard_review_reasons(fit, fp):
-    reasons = []
+def _clip01(x):
+    return min(max(x, 0.0), 1.0)
+
+
+def pseudo_score(fit, fp):
+    """A crude monotone 0-1 summary so the placement record has one comparable number under either method.
+    NOT a probability and not calibrated (ported from geo.validate._pseudo_score, without numpy)."""
+    terms = (
+        _clip01(fit.iou / 0.85),
+        _clip01(1.0 - fit.hausdorff_m / 6.0),
+        _clip01(1.0 - abs(math.log(max(fit.area_ratio, 1e-6))) / 0.35),
+        _clip01(fit.rotation_margin_footprint / 0.20),
+        _clip01(fp.rectilinearity),
+    )
+    return float(sum(terms) / len(terms))
+
+
+def hard_rules(fit, fp):
+    """Floors under the decision: [(Decision.REVIEW or REJECT, reason)]. They apply to both methods."""
+    rules = []
+    if fit.is_mirrored:
+        rules.append((REJECT, "mirrored mesh - det(R) < 0; reflections are rejected, never accepted (SPEC 6.8)"))
     if fit.disambiguated_by in GUESSED_ORIENTATION:
-        reasons.append(f"orientation was guessed (disambiguated_by={fit.disambiguated_by}); review regardless of IoU (A.3/A.4)")
-    if _finite("rectilinearity", fp.rectilinearity) < ROUND_BUILDING_RECTILINEARITY:
-        reasons.append(f"rectilinearity {fp.rectilinearity:.2f} < {ROUND_BUILDING_RECTILINEARITY}: round/organic building, rotation is meaningless (SPEC 10.2 #8)")
-    return tuple(reasons)
+        rules.append((REVIEW, f"orientation was guessed (disambiguated_by={fit.disambiguated_by.value}); review regardless of IoU (A.3/A.4)"))
+    if fp.is_ill_posed:
+        rules.append((REVIEW, f"rectilinearity {fp.rectilinearity:.2f} < 0.6: round/organic building, rotation is intrinsically meaningless (SPEC 10.2 #8)"))
+    if fp.match_quality == "unnamed_sole_candidate":
+        rules.append((REVIEW, "footprint matched only as the sole nearby candidate, with no name match - verify it is the right building before accepting (SPEC 3.2)"))
+    elif not fp.match_quality:
+        rules.append((REVIEW, "footprint match quality unrecorded - treat as unverified (SPEC 3.2)"))
+    if fp.is_multipart:
+        rules.append((REVIEW, f"multi-part footprint ({1 + len(fp.parts_enu)} disjoint outer rings): the OMBB and rotation come from the largest part only"))
+    if fit.exif_silhouette_disagree is True:
+        rules.append((REVIEW, "EXIF and the silhouette picked different candidates - independent evidence conflicts (A.3)"))
+    return tuple(rules)
 
 
 # --------------------------------------------------------------- learned model
@@ -179,6 +224,22 @@ def learned_gate_enabled():
     if raw in _FALSE:
         return False
     raise ValueError(f"{ENV_FLAG}={raw!r} is not a recognised value; use 1/0")
+
+
+def resolve_method(method=None):
+    if method is None:
+        method = METHOD_LEARNED if learned_gate_enabled() else METHOD_TABLE
+    if method not in METHODS:
+        raise ValueError(f"unknown confidence method {method!r}; use one of {METHODS}")
+    return method
+
+
+class ModelAbsentError(FileNotFoundError):
+    """No model file at `path`: the one condition under which method="learned" falls back to the table."""
+
+    def __init__(self, path, hint):
+        super().__init__(f"no learned-gate model at {path}; {hint}")
+        self.path = Path(path)
 
 
 @dataclass(frozen=True)
@@ -198,13 +259,13 @@ class LearnedModel:
 
 
 def load_model(path=None, *, allow_synthetic=False):
-    """Read the model.json written by confidence/train.py. Raises rather than guessing."""
+    """Read the model.json written by confidence/train.py. Absent -> ModelAbsentError; anything else wrong raises."""
     import json
 
     path = Path(path or os.environ.get(ENV_MODEL) or DEFAULT_MODEL_PATH)
-    hint = f"train one with confidence/train.py, or unset {ENV_FLAG} to use the SPEC 9.1 table"
+    hint = "train one with confidence/train.py"
     if not path.is_file():
-        raise FileNotFoundError(f"learned gate is enabled but there is no model at {path}; {hint}")
+        raise ModelAbsentError(path, hint)
     try:
         spec = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:
@@ -214,7 +275,7 @@ def load_model(path=None, *, allow_synthetic=False):
     if missing:
         raise ValueError(f"learned gate model {path} is missing {missing}")
     if spec["trained_on_synthetic"] and not allow_synthetic:
-        raise ValueError(f"learned gate model {path} was trained on SYNTHETIC data (fixtures/fake_fits.py) and must not gate real placements; {hint}")
+        raise ValueError(f"learned gate model {path} was trained on SYNTHETIC data (fixtures/fake_fits.py) and must not gate real placements; {hint} on real benchmark rows")
     names, n = tuple(spec["feature_names"]), len(spec["feature_names"])
     if not (len(spec["scaler_mean"]) == len(spec["scaler_scale"]) == len(spec["coef_standardised"]) == n) or n == 0:
         raise ValueError(f"learned gate model {path}: feature/scaler/coefficient lengths disagree")
@@ -226,19 +287,10 @@ def load_model(path=None, *, allow_synthetic=False):
     )
 
 
-def _learned(fit, photo, fp, model, geocode_rooftop, height_source_authoritative):
-    import features  # lazy: the table path must not need numpy
+def _learned(fit, photo, fp, model):
+    from confidence import features  # lazy: the table must not need the feature code
 
-    supplied = {"geocode_rooftop": geocode_rooftop, "height_source_authoritative": height_source_authoritative}
-    absent = [n for n in supplied if n in model.feature_names and supplied[n] is None]
-    if absent:
-        raise ValueError(f"the learned model uses {absent}, which are not in FitResult/PhotoEvidence/Footprint; pass them to the gate")
-    values = features.feature_dict(
-        fit, photo, fp,
-        geocode_rooftop=bool(geocode_rooftop) if geocode_rooftop is not None else False,  # unused by this model
-        height_source_authoritative=bool(height_source_authoritative) if height_source_authoritative is not None else False,
-    )
-    p = model.probability(values)
+    p = model.probability(features.feature_dict(fit, photo, fp))
     if model.p_accept is not None and p >= model.p_accept:
         decision = AUTO_ACCEPT
     elif model.p_reject is not None and p <= model.p_reject:
@@ -247,37 +299,50 @@ def _learned(fit, photo, fp, model, geocode_rooftop, height_source_authoritative
         decision = REVIEW
     accept = "none (model cannot reach the precision target)" if model.p_accept is None else f"{model.p_accept:.3f}"
     reject = "none" if model.p_reject is None else f"{model.p_reject:.3f}"
-    return p, decision, f"learned p={p:.3f} (p_accept={accept}, p_reject={reject}) -> {decision}"
+    return p, decision, f"learned p={p:.3f} (p_accept={accept}, p_reject={reject}) -> {decision.value}"
 
 
 # --------------------------------------------------------------------- the gate
 
 
-def evaluate_gate(
-    fit, photo, fp, *, geocode_rooftop=None, height_source_authoritative=None, use_learned=None, model=None, allow_synthetic=False
-) -> GateDecision:
-    """The inspectable gate. `use_learned=None` reads PROCEDURA_LEARNED_GATE (default off -> table)."""
+def evaluate_gate(fit, photo, fp, *, method=None, model=None, allow_synthetic=False) -> GateDecision:
+    """The inspectable gate. `method=None` reads PROCEDURA_LEARNED_GATE (default off -> the table)."""
+    requested = resolve_method(method)
     checks = table_checks(fit, fp)
     table_decision = worst(c.band for c in checks)
-    forced = hard_review_reasons(fit, fp)
+    table_reasons = [f"{c.name}={c.value:.4g} -> {c.band.value} ({c.rule})" for c in checks if c.band != AUTO_ACCEPT]
+    forced = hard_rules(fit, fp)
 
-    learned = learned_gate_enabled() if use_learned is None else bool(use_learned)
-    if learned:
-        model = model or load_model(allow_synthetic=allow_synthetic)
-        probability, decision, why = _learned(fit, photo, fp, model, geocode_rooftop, height_source_authoritative)
-        reasons = [why]
-    else:
-        probability, decision, reasons = None, table_decision, []
-    reasons += [f"{c.name}={c.value:.4g} -> {c.band} ({c.rule})" for c in checks if c.band != AUTO_ACCEPT]
-    if forced and decision == AUTO_ACCEPT:
-        decision = REVIEW
-    return GateDecision(decision, probability, "learned" if learned else "table", table_decision, checks, tuple(reasons), forced)
+    ran, decision, probability, fallback = METHOD_TABLE, table_decision, None, None
+    reasons = []
+    if requested == METHOD_LEARNED:
+        try:
+            model = model or load_model(allow_synthetic=allow_synthetic)
+        except ModelAbsentError as exc:
+            fallback = f"learned gate requested but its model file is absent ({exc.path}); using the SPEC 9.1 threshold table"
+            reasons.append(fallback)
+        else:
+            ran = METHOD_LEARNED
+            probability, decision, why = _learned(fit, photo, fp, model)
+            reasons.append(why)
+            if decision != table_decision:
+                reasons.append(f"DISAGREEMENT: threshold table says {table_decision.value}, learned gate says {decision.value}")
+                reasons.extend(table_reasons[:3])
+    reasons.extend(r for r in table_reasons if r not in reasons)
+    reasons.extend(why for _, why in forced)
+    decision = worst([decision, *(floor for floor, _ in forced)])
+    score = probability if probability is not None else pseudo_score(fit, fp)
+    return GateDecision(decision, probability, score, ran, requested, fallback, table_decision, checks, tuple(reasons), forced)
 
 
-def score_confidence(fit, photo, fp, **kwargs):
-    """ML_ADDENDUM F.1: -> (probability, decision). probability is NaN on the table path (the table has none).
+def score_confidence(fit, photo, fp, *, method=None, **kwargs):
+    """contracts.ScoreConfidence: -> (score, Decision). `score` is the model's probability on the learned path
+    and the table's pseudo_score otherwise (see the module docstring)."""
+    result = evaluate_gate(fit, photo, fp, method=method, **kwargs)
+    return result.score, result.decision
 
-    Keyword arguments are those of evaluate_gate; the F.1 three-argument call runs the table.
-    """
-    result = evaluate_gate(fit, photo, fp, **kwargs)
-    return (math.nan if result.probability is None else result.probability), result.decision
+
+def score_confidence_verbose(fit, photo, fp, *, method=None, **kwargs):
+    """As score_confidence, plus the reasons for the review queue (what pipeline.py calls)."""
+    result = evaluate_gate(fit, photo, fp, method=method, **kwargs)
+    return result.score, result.decision, list(result.reasons)

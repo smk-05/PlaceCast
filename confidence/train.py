@@ -5,8 +5,8 @@ reliability diagram. No calibration layer.
     python confidence/train.py [--source fake] [--seed 0] [--out-dir DIR]
                                [--accept-precision 0.95] [--reject-precision 0.95]
 
-Rows are anything exposing .fit .photo .footprint .geocode_rooftop .height_source_authoritative
-and .label (1 = a human would accept the placement). Only the synthetic source
+Rows are anything exposing .fit .photo .footprint (the contracts.py objects) and .label (1 = a human
+would accept the placement). Only the synthetic source
 (fixtures/fake_fits.py) exists until the solver produces real benchmark runs (F.4); swapping the
 source is a change to load_rows() alone. A model trained on the fake source is flagged
 `trained_on_synthetic` in model.json and must never be shipped.
@@ -49,7 +49,7 @@ for path in (str(ROOT), str(HERE)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-import features as feat  # noqa: E402
+from confidence import features as feat  # noqa: E402
 
 MIN_ROWS_FULL_MODEL = 60  # B.4
 IMBALANCE_THRESHOLD = 0.25  # B.4: a class below this share -> class_weight='balanced'
@@ -67,9 +67,9 @@ DEFAULT_OUT_DIR = ROOT / "outputs" / "confidence"
 
 def load_rows(source, seed=0):
     if source == "fake":
-        from fixtures.fake_fits import generate
+        from fixtures.fake_fits import generate_labelled
 
-        return generate(seed=seed)
+        return generate_labelled(seed=seed)
     raise ValueError(f"unknown source {source!r}: only 'fake' exists until real benchmark runs land (F.4)")
 
 

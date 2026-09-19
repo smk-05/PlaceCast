@@ -1,42 +1,42 @@
-#!/usr/bin/env python
-"""Orientation fusion ladder (ML_ADDENDUM A.3 "Fusion with the other filters", SPEC 6.6).
+"""Orientation fusion ladder (ML_ADDENDUM A.3 "Fusion with the other filters"), on contracts.py types.
 
-    choice = choose_orientation(photo, comparison, facade_heading, road_normal_deg=None)
-    choice.candidate, choice.disambiguated_by, choice.needs_review, choice.reason
+    choice = choose_orientation(photo, candidates, facade_heading, road_normal_deg=None, symmetric=False)
+    choice.candidate, choice.disambiguated_by, choice.needs_review, choice.reason,
+    choice.silhouette_margin, choice.exif_silhouette_disagree
+
+The pipeline's own ladder is geo.disambiguate.choose_orientation (five levels, and it owns the facade-to-bearing
+mapping). This is the perception-side statement of the A.3 ladder over the same objects, kept so the precedence
+rules and their edge cases are pinned by tests independently of geo. It uses the same vocabulary, and the same
+meaning of every field.
 
 Precedence (never let render-and-compare silently override a confident EXIF heading):
-  1. EXIF GPSImgDirection present and plausible  -> it decides      "exif_heading"
-  2. else silhouette margin >= 0.08              -> silhouette      "silhouette"
-  3. else road-normal prior (SPEC 6.6 Filter 3)  -> nearest facade  "road_normal", needs_review
+  1. EXIF GPSImgDirection present and plausible  -> it decides      Disambiguator.EXIF_HEADING
+  2. else PhotoEvidence.has_silhouette_evidence  -> silhouette       Disambiguator.SILHOUETTE   (margin >= 0.08)
+  3. else road-normal prior (SPEC 6.6 Filter 3)  -> nearest facade   Disambiguator.ROAD_NORMAL, needs_review
      regardless of IoU: you are now guessing.
-  Disagreement is recorded, never acted on: `exif_silhouette_disagree` is True when EXIF decided AND
-  the silhouette margin was >= 0.08 AND the silhouette's best candidate differs from EXIF's pick.
-  EXIF still wins; the flag (with `silhouette_margin`, recorded on every branch) is a feature for
-  the confidence gate, since the two are independent evidence and their conflict signals a problem.
-  If none of these has evidence, the silhouette's best candidate is returned, flagged for
-  review, as "arbitrary_symmetric" when Comparison.label says so (A.4), else "unresolved".
-  "unresolved" is not in the spec's vocabulary; map it as you see fit downstream.
+  If nothing has evidence, the best-silhouette candidate (else the first) is returned, flagged for review, as
+  ARBITRARY_SYMMETRIC when the caller says the footprint is symmetric (A.4), else ASPECT_RATIO: the value
+  contracts.py gives "nothing else decided".
+
+`exif_silhouette_disagree` follows the contract (FitResult.exif_silhouette_disagree): None unless BOTH cues
+produced a choice, then whether they differ. It is recorded and never acted on; EXIF still wins.
 
 Inputs
-  photo        PhotoEvidence-shaped: only `exif_heading_deg` (float | None) is read. contracts.py
-               is frozen, so this is duck-typed rather than imported. `photo.silhouette_margin`
-               is ignored: `comparison.margin` is the source of truth.
-  comparison   a render_compare.Comparison (needs .candidates, .best, .margin, .label).
-  facade_heading  callable(Candidate) -> float, supplied by geo/. The compass bearing (degrees
-               clockwise from north) of the outward normal of the facade the photo shows, if that
-               candidate were the true orientation. Perception cannot compute it: it depends on the
-               footprint rotation theta_k = theta0 + k*90 deg (SPEC 6.5). SPEC 2.4: bearing =
-               90 deg - theta for a math angle theta. Required whenever EXIF or the road normal is
-               used; a missing mapping raises rather than silently skipping evidence.
-  road_normal_deg  bearing (degrees clockwise from north) of the footprint's outward normal toward
-               the nearest road. Fetched by geo/, never here. `bearing_from_enu` converts (east, north).
+  photo         a contracts.PhotoEvidence: exif_heading_deg, silhouette_scores {CandidateId: iou},
+                silhouette_margin, has_silhouette_evidence.
+  candidates    the viable geo placement candidates (CandidateId), e.g. geo.disambiguate.viable_by_aspect. EXIF and
+                the road normal choose among them; the up-axis is not something either can resolve.
+  facade_heading  callable(CandidateId) -> compass bearing (deg clockwise from north) the mesh front faces under
+                that placement: geo.disambiguate.facade_heading with fp and mo bound. It raises ValueError when the
+                mesh front is unknown; that means "no bearing" (the cue abstains, and the reason says so), never
+                a default. Any other failure, including a non-finite bearing, propagates.
+  road_normal_deg  bearing of the footprint's outward normal toward the nearest road (fetched by geo/, never
+                here). `bearing_from_enu` converts (east, north).
 
-Up-axis is not something EXIF or a road can resolve, so branches 1 and 3 pick among the four
-azimuths that share the silhouette best's up-axis. The EXIF heading is the camera's pointing
-direction, so the photographed facade faces the opposite bearing (heading + 180). EXIF is
-assumed to be relative to true north (PhotoEvidence does not carry GPSImgDirectionRef); an
-implausible value (outside [0, 360), non-finite, non-numeric) is ignored and the reason says so.
-Ties (a heading or normal exactly between two facades) go to the better silhouette score.
+The EXIF heading is the camera's pointing direction, so the photographed facade faces the opposite bearing
+(heading + 180). EXIF is assumed relative to true north (PhotoEvidence carries no GPSImgDirectionRef). An
+implausible value (outside [0, 360), non-finite, non-numeric) is ignored and the reason says so. Ties go to the
+better silhouette score.
 """
 from __future__ import annotations
 
@@ -44,23 +44,17 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-SILHOUETTE_DECISIVE_MARGIN = 0.08  # A.3 precedence rule 2
-EXIF_HEADING = "exif_heading"
-SILHOUETTE = "silhouette"
-ROAD_NORMAL = "road_normal"
-ARBITRARY_SYMMETRIC = "arbitrary_symmetric"  # matches render_compare.ARBITRARY_SYMMETRIC (A.4)
-UNRESOLVED = "unresolved"  # no evidence at all; not in the spec's vocabulary
-_TIE_DECIMALS = 6  # angular differences equal to this many decimals count as a tie
+from contracts import CandidateId, Disambiguator
 
 
 @dataclass(frozen=True)
 class OrientationChoice:
-    candidate: object  # a render_compare.Candidate
-    disambiguated_by: str
+    candidate: CandidateId
+    disambiguated_by: Disambiguator
     needs_review: bool
     reason: str  # human-readable audit trail for the intermediate-artifact log
-    silhouette_margin: float  # comparison.margin, whichever branch decided (a confidence-gate feature)
-    exif_silhouette_disagree: bool = False  # EXIF decided, silhouette was confident, and picked another candidate
+    silhouette_margin: float  # photo.silhouette_margin, whichever cue decided (a confidence-gate feature)
+    exif_silhouette_disagree: Optional[bool] = None  # None when either cue was absent
 
 
 def bearing_from_enu(east: float, north: float) -> float:
@@ -84,78 +78,83 @@ def plausible_heading(value) -> Optional[float]:
     return heading if math.isfinite(heading) and 0.0 <= heading < 360.0 else None
 
 
-def _nearest_facade(candidates, bearing, facade_heading):
-    """(candidate, its facade bearing, angular difference) closest to `bearing`; ties -> better score."""
+def _nearest_facade(candidates, bearing, facade_heading, scores):
+    """(candidate, its facade bearing, angular difference) closest to `bearing`; ties -> better silhouette score.
+
+    Raises ValueError when facade_heading does ("mesh front unknown"); the caller treats that as abstaining.
+    """
     ranked = []
-    for c in candidates:
+    for order, c in enumerate(candidates):
         facing = float(facade_heading(c))
         if not math.isfinite(facing):
-            raise ValueError(f"facade_heading returned {facing!r} for candidate {c}")
-        ranked.append((round(angular_diff_deg(facing, bearing), _TIE_DECIMALS), -c.score, c, facing))
-    diff, _, chosen, facing = min(ranked, key=lambda r: r[:2])
+            raise RuntimeError(f"facade_heading returned {facing!r} for candidate {c}")
+        ranked.append((round(angular_diff_deg(facing, bearing), 6), -scores.get(c, 0.0), order, c, facing))
+    diff, _, _, chosen, facing = min(ranked, key=lambda r: r[:3])
     return chosen, facing, diff
 
 
-def _need_mapping(facade_heading, evidence):
-    if facade_heading is None:
-        raise ValueError(f"{evidence} is available but facade_heading was not supplied; cannot map it to a candidate")
+def _best_by_silhouette(candidates, scores):
+    return max(candidates, key=lambda c: scores.get(c, float("-inf")))  # first maximum: stable
 
 
-def choose_orientation(
-    photo, comparison, facade_heading: Optional[Callable] = None, road_normal_deg: Optional[float] = None
-) -> OrientationChoice:
-    up = comparison.best.up_axis
-    same_up = [c for c in comparison.candidates if c.up_axis == up]
+def choose_orientation(photo, candidates, facade_heading: Callable, road_normal_deg=None, symmetric=False) -> OrientationChoice:
+    candidates = list(candidates)
+    if not candidates:
+        raise ValueError("no candidates to choose among")
+    scores = dict(photo.silhouette_scores)
+    margin = photo.silhouette_margin
+    notes = []
+
+    # --- evaluate both evidence cues independently, so their disagreement can be recorded ---------------------
     raw = photo.exif_heading_deg
     heading = plausible_heading(raw)
-    note = f"exif heading {raw!r} implausible, ignored; " if raw is not None and heading is None else ""
-
-    # 1. EXIF heading decides.
+    if raw is not None and heading is None:
+        notes.append(f"exif heading {raw!r} implausible, ignored")
+    exif_choice = exif_reason = None
     if heading is not None:
-        _need_mapping(facade_heading, "an EXIF heading")
         facing = (heading + 180.0) % 360.0  # the photographed facade faces back toward the camera
-        chosen, bearing, diff = _nearest_facade(same_up, facing, facade_heading)
-        best = comparison.best
-        disagree = comparison.margin >= SILHOUETTE_DECISIVE_MARGIN and (chosen.up_axis, chosen.azimuth_deg) != (
-            best.up_axis,
-            best.azimuth_deg,
-        )
-        reason = (
-            f"exif heading {heading:.1f} -> photographed facade faces {facing:.1f}; "
-            f"nearest candidate faces {bearing:.1f} ({diff:.1f} deg off)"
-        )
-        if disagree:
-            reason += f"; DISAGREES with a confident silhouette (margin {comparison.margin:.3f}, prefers azimuth {best.azimuth_deg:.0f})"
-        return OrientationChoice(chosen, EXIF_HEADING, False, reason, comparison.margin, disagree)
+        try:
+            exif_choice, bearing, diff = _nearest_facade(candidates, facing, facade_heading, scores)
+            exif_reason = (f"exif heading {heading:.1f} -> photographed facade faces {facing:.1f}; "
+                           f"nearest candidate faces {bearing:.1f} ({diff:.1f} deg off)")
+        except ValueError as exc:
+            notes.append(f"EXIF bearing present but cannot be mapped to a facade ({exc})")
+
+    sil_choice = None
+    if photo.has_silhouette_evidence:
+        in_play = [c for c in candidates if c in scores]
+        sil_choice = _best_by_silhouette(in_play, scores) if in_play else None
+
+    disagree = (exif_choice != sil_choice) if exif_choice is not None and sil_choice is not None else None
+    lead = "; ".join(notes) + ("; " if notes else "")
+
+    def done(candidate, by, review, reason):
+        return OrientationChoice(candidate, by, review, lead + reason, margin, disagree)
+
+    # 1. EXIF decides.
+    if exif_choice is not None:
+        extra = f"; DISAGREES with a confident silhouette (margin {margin:.3f})" if disagree else ""
+        return done(exif_choice, Disambiguator.EXIF_HEADING, False, exif_reason + extra)
 
     # 2. A confident silhouette decides.
-    if comparison.margin >= SILHOUETTE_DECISIVE_MARGIN:
-        return OrientationChoice(
-            comparison.best, SILHOUETTE, False,
-            f"{note}silhouette margin {comparison.margin:.3f} >= {SILHOUETTE_DECISIVE_MARGIN}",
-            comparison.margin,
-        )
+    if sil_choice is not None:
+        return done(sil_choice, Disambiguator.SILHOUETTE, False, f"silhouette margin {margin:.3f} >= 0.08")
 
     # 3. Road-normal prior; a guess, so always review.
     if road_normal_deg is not None:
         road = float(road_normal_deg)
         if not math.isfinite(road):
             raise ValueError(f"road_normal_deg must be finite, got {road_normal_deg!r}")
-        _need_mapping(facade_heading, "a road normal")
-        road %= 360.0
-        chosen, bearing, diff = _nearest_facade(same_up, road, facade_heading)
-        return OrientationChoice(
-            chosen, ROAD_NORMAL, True,
-            f"{note}silhouette margin {comparison.margin:.3f} < {SILHOUETTE_DECISIVE_MARGIN} and no usable EXIF; "
-            f"road normal {road:.1f} -> nearest candidate faces {bearing:.1f} ({diff:.1f} deg off); guessing",
-            comparison.margin,
-        )
+        try:
+            chosen, bearing, diff = _nearest_facade(candidates, road % 360.0, facade_heading, scores)
+        except ValueError as exc:
+            lead += f"road normal cannot be mapped to a facade ({exc}); "
+        else:
+            return done(chosen, Disambiguator.ROAD_NORMAL, True,
+                        f"silhouette margin {margin:.3f} < 0.08 and no usable EXIF; road normal {road % 360.0:.1f} -> "
+                        f"nearest candidate faces {bearing:.1f} ({diff:.1f} deg off); guessing")
 
-    # No evidence left: return the silhouette's pick, visibly unreliable.
-    label = getattr(comparison, "label", None)
-    return OrientationChoice(
-        comparison.best, ARBITRARY_SYMMETRIC if label == ARBITRARY_SYMMETRIC else UNRESOLVED, True,
-        f"{note}silhouette margin {comparison.margin:.3f} < {SILHOUETTE_DECISIVE_MARGIN}, no usable EXIF, "
-        "no road normal; returning the silhouette's best candidate",
-        comparison.margin,
-    )
+    # No evidence left: the best silhouette candidate, visibly unreliable.
+    by = Disambiguator.ARBITRARY_SYMMETRIC if symmetric else Disambiguator.ASPECT_RATIO
+    return done(_best_by_silhouette(candidates, scores), by, True,
+                f"silhouette margin {margin:.3f} < 0.08, no usable EXIF, no road normal; nothing decided")

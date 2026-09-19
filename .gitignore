@@ -1,10 +1,23 @@
-﻿.venv/
+.venv/
+.venv-ml/
 __pycache__/
-*.pyc
-.env
-scratch_*.py
+*.py[cod]
+.pytest_cache/
+.cache/
+data/
+node_modules/
+web/dist/
 *.ckpt
 *.pth
 *.safetensors
 *.glb
+*.ply
+.env
+scratch_*.py
+
+# The footprint cache IS committed — it is small, and it is what saves the demo
+# when Overpass rate-limits mid-judging (spec 3.2, failure mode 12).
+!fixtures/footprints/
+
+# Generated artifacts (confidence/train.py, perception/segment.py outputs)
 outputs/

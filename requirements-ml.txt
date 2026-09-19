@@ -1,0 +1,41 @@
+# Perception / ML half — NOT installed on the geometry machine.
+# Target: Python 3.11, CUDA GPU.
+#
+#   uv venv --python 3.11 .venv-ml
+#   uv pip install --python .venv-ml torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   uv pip install --python .venv-ml -r requirements-ml.txt
+#
+# Set HF_HOME to a drive with room before first run — weights are 10+ GB:
+#   [Environment]::SetEnvironmentVariable('HF_HOME','D:\geos_hackathon_vt\.cache\hf','User')
+
+# --- shared with the geometry half (contracts.py + fixtures need these) ---
+numpy>=1.26,<2.2
+scipy>=1.13                     # perception/segment.py (components, hole fill), confidence/
+shapely>=2.0
+trimesh>=4.4
+scikit-image>=0.24
+opencv-python-headless>=4.10
+pillow>=10.3
+
+# --- section A: segmentation + silhouette scoring ---
+transformers>=4.44              # Grounding DINO and SAM 2 are both supported here
+accelerate>=0.33
+# Fallback if the Grounded-SAM-2 chain is slow to set up (addendum A.2):
+#   a SegFormer / DeepLabv3 ADE20K checkpoint via transformers — single forward pass.
+
+# --- tests ---
+pytest>=8.2
+
+# --- section B: the learned confidence gate (the component we train) ---
+scikit-learn>=1.5               # LogisticRegression(penalty='l2'), LOO CV
+pandas>=2.2
+matplotlib>=3.9                 # reliability diagram, coefficient table
+
+# --- section C: monocular metric depth. CONDITIONAL. ---
+# Do NOT install until the C.1 height-coverage check says so.
+# scripts/check_height_coverage.py decides this; >= 80% OSM/Microsoft coverage
+# means skip section C entirely and spend the time on A and B.
+#   pip install unidepth   (see arXiv:2502.20110 — UniDepthV2)
+
+# NOTE: avoid pyrender. Offscreen OpenGL is painful on Windows and unnecessary —
+# A.3's silhouette renders are plain triangle rasterisation in numpy/skimage.
