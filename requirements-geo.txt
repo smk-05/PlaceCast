@@ -7,6 +7,11 @@ shapely>=2.0                    # ring-aware ops + STRtree; 3.3 requires ring aw
 pyproj>=3.6                     # ECEF/ENU cross-check + geoid fallback (2.2, 2.3)
 trimesh>=4.4
 networkx>=3.2                   # trimesh soft dep for mesh graph ops
+mapbox-earcut>=1.0              # trimesh polygon triangulation: extrude_polygon
+                                # (perception/openings_prism.py) raises
+                                # "No available triangulation engine!" without it
+rtree>=1.3                      # trimesh ray queries used by the same module
+pygltflib>=1.16                 # perception/openings_3d.py writes the marker glTF
 scikit-image>=0.24              # marching squares (6.3), morphology, polygon raster
 opencv-python-headless>=4.10    # minAreaRect (4.4). headless = no Qt conflict
 matplotlib>=3.9                 # the 9.3 overlay PNG
