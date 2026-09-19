@@ -34,7 +34,9 @@ purpose (this module must not import geo/); tests/test_gate.py asserts the two a
 Hard rules, applied on BOTH methods. Each sets a floor under the decision; they never lower it:
   reject  the fit is a reflection (fit.is_mirrored, SPEC 1.2 / 6.8 / 10.2 #5): rejected, never accepted
   review  orientation was guessed: fit.disambiguated_by is ROAD_NORMAL, FACADE_DETAIL or ARBITRARY_SYMMETRIC
-          (A.3 / A.4: flag regardless of IoU; both ROAD_NORMAL and FACADE_DETAIL come from the street-facing prior)
+          (A.3 / A.4: flag regardless of IoU; ROAD_NORMAL and FACADE_DETAIL come from the street-facing prior),
+          or ASPECT_RATIO (the no-cue fallback) while the rotation margin is below the 9.1 accept threshold. At or
+          above it the footprint IoU decided the orientation, which is geometric evidence.
   review  round or organic building (fp.is_ill_posed, R < 0.6; SPEC 10.2 #8): rotation is meaningless
   review  footprint matched on thin evidence (fp.match_quality is "unnamed_sole_candidate" or unrecorded): a
           high IoU against the WRONG building is the most dangerous output this pipeline can produce
@@ -74,7 +76,21 @@ ENV_MODEL = "PROCEDURA_GATE_MODEL"
 DEFAULT_MODEL_PATH = ROOT / "outputs" / "confidence" / "model.json"
 _TRUE, _FALSE = {"1", "true", "yes", "on"}, {"", "0", "false", "no", "off"}
 
+ROTATION_MARGIN_ACCEPT = 0.05  # SPEC 9.1: the footprint-IoU margin between the top two candidates, accept at or above
+
+# Every Disambiguator is evidence (EXIF_HEADING, SILHOUETTE), a guess, or evidence-when-decisive.
 GUESSED_ORIENTATION = frozenset({Disambiguator.ROAD_NORMAL, Disambiguator.FACADE_DETAIL, Disambiguator.ARBITRARY_SYMMETRIC})
+# ASPECT_RATIO is geo.disambiguate's final fallback: it only excludes the 90-degree candidates and then takes the
+# best footprint IoU. That is a guess when the top two candidates tie (rotation margin below the 9.1 accept
+# threshold) and geometric evidence when one clearly wins.
+GUESSED_BELOW_MARGIN = frozenset({Disambiguator.ASPECT_RATIO})
+
+
+def orientation_guessed(fit):
+    """True when fit.disambiguated_by is a guess. A non-finite margin is a guess, never evidence."""
+    if fit.disambiguated_by in GUESSED_ORIENTATION:
+        return True
+    return fit.disambiguated_by in GUESSED_BELOW_MARGIN and not fit.rotation_margin_footprint >= ROTATION_MARGIN_ACCEPT
 
 
 # ---------------------------------------------------------------- data types
@@ -118,7 +134,7 @@ def _band_area_ratio(v):
 
 
 def _band_rotation_margin(v):
-    return AUTO_ACCEPT if v >= 0.05 else REVIEW
+    return AUTO_ACCEPT if v >= ROTATION_MARGIN_ACCEPT else REVIEW
 
 
 def _band_rectilinearity(v):
@@ -199,8 +215,10 @@ def hard_rules(fit, fp):
     rules = []
     if fit.is_mirrored:
         rules.append((REJECT, "mirrored mesh - det(R) < 0; reflections are rejected, never accepted (SPEC 6.8)"))
-    if fit.disambiguated_by in GUESSED_ORIENTATION:
-        rules.append((REVIEW, f"orientation was guessed (disambiguated_by={fit.disambiguated_by.value}); review regardless of IoU (A.3/A.4)"))
+    if orientation_guessed(fit):
+        why = (f"; rotation margin {fit.rotation_margin_footprint:.3g} < {ROTATION_MARGIN_ACCEPT}, the top candidates tie"
+               if fit.disambiguated_by in GUESSED_BELOW_MARGIN else "")
+        rules.append((REVIEW, f"orientation was guessed (disambiguated_by={fit.disambiguated_by.value}{why}); review regardless of IoU (A.3/A.4)"))
     if fp.is_ill_posed:
         rules.append((REVIEW, f"rectilinearity {fp.rectilinearity:.2f} < 0.6: round/organic building, rotation is intrinsically meaningless (SPEC 10.2 #8)"))
     if fp.match_quality == "unnamed_sole_candidate":

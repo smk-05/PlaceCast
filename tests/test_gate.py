@@ -138,14 +138,55 @@ class ScoreTests(unittest.TestCase):
 
 
 class HardRuleTests(unittest.TestCase):
-    def test_a_guessed_orientation_is_reviewed_regardless_of_iou(self):
-        for how in (Disambiguator.ROAD_NORMAL, Disambiguator.FACADE_DETAIL, Disambiguator.ARBITRARY_SYMMETRIC):
-            r = gate.evaluate_gate(fit(iou=0.99, disambiguated_by=how), PHOTO, FP)
+    def _assert_guess_is_reviewed(self, how):
+        r = gate.evaluate_gate(fit(iou=0.99, disambiguated_by=how), PHOTO, FP)
+        self.assertIs(r.decision, R, how)
+        self.assertIs(r.table_decision, A)  # the table alone would have accepted
+        self.assertIn(how.value, r.forced[0][1])
+
+    def test_road_normal_is_a_guess(self):
+        self._assert_guess_is_reviewed(Disambiguator.ROAD_NORMAL)
+
+    def test_facade_detail_is_a_guess(self):
+        self._assert_guess_is_reviewed(Disambiguator.FACADE_DETAIL)
+
+    def test_arbitrary_symmetric_is_a_guess(self):
+        self._assert_guess_is_reviewed(Disambiguator.ARBITRARY_SYMMETRIC)
+
+    def test_aspect_ratio_with_a_decisive_margin_is_geometric_evidence(self):
+        r = gate.evaluate_gate(fit(iou=0.99, rotation_margin_footprint=0.20,disambiguated_by=Disambiguator.ASPECT_RATIO), PHOTO, FP)
+        self.assertIs(r.decision, A)
+        self.assertEqual(r.forced, ())
+
+    def test_aspect_ratio_at_the_accept_threshold_is_evidence_and_just_below_is_a_guess(self):
+        at = fit(iou=0.99, rotation_margin_footprint=gate.ROTATION_MARGIN_ACCEPT, disambiguated_by=Disambiguator.ASPECT_RATIO)
+        self.assertEqual(gate.hard_rules(at, FP), ())  # 9.1 accepts a margin equal to the threshold
+        below = replace(at, rotation_margin_footprint=gate.ROTATION_MARGIN_ACCEPT - 1e-9)
+        self.assertEqual(len(gate.hard_rules(below, FP)), 1)
+
+    def test_aspect_ratio_with_a_tied_margin_is_a_guess_and_the_reason_names_it(self):
+        f = fit(iou=0.99, rotation_margin_footprint=0.01, disambiguated_by=Disambiguator.ASPECT_RATIO)
+        r = gate.evaluate_gate(f, PHOTO, FP)
+        self.assertIs(r.decision, R)
+        self.assertEqual([d for d, _ in gate.hard_rules(f, FP)], [R])  # forced by the rule itself, not only the margin band
+        self.assertIn(Disambiguator.ASPECT_RATIO.value, r.forced[0][1])
+        self.assertIn("rotation margin", r.forced[0][1])
+
+    def test_the_other_guesses_ignore_the_margin(self):
+        for how in gate.GUESSED_ORIENTATION:
+            r = gate.evaluate_gate(fit(iou=0.99, rotation_margin_footprint=0.90, disambiguated_by=how), PHOTO, FP)
             self.assertIs(r.decision, R, how)
-            self.assertIs(r.table_decision, A)  # the table alone would have accepted
             self.assertIn(how.value, r.forced[0][1])
-        for how in (Disambiguator.EXIF_HEADING, Disambiguator.SILHOUETTE, Disambiguator.ASPECT_RATIO):
+
+    def test_only_exif_and_silhouette_orientation_can_be_accepted(self):
+        for how in (Disambiguator.EXIF_HEADING, Disambiguator.SILHOUETTE):
             self.assertIs(gate.evaluate_gate(fit(disambiguated_by=how), PHOTO, FP).decision, A, how)
+
+    def test_every_disambiguator_is_classified_as_evidence_or_guess(self):
+        evidence = {Disambiguator.EXIF_HEADING, Disambiguator.SILHOUETTE}
+        classified = gate.GUESSED_ORIENTATION | gate.GUESSED_BELOW_MARGIN
+        self.assertEqual(classified, set(Disambiguator) - evidence)  # a new value must be decided here
+        self.assertFalse(gate.GUESSED_ORIENTATION & gate.GUESSED_BELOW_MARGIN)
 
     def test_round_buildings_are_forced_to_review(self):
         r = gate.evaluate_gate(fit(), PHOTO, fp(0.55))
