@@ -45,3 +45,7 @@ matplotlib>=3.9                 # reliability diagram, coefficient table
 
 # NOTE: avoid pyrender. Offscreen OpenGL is painful on Windows and unnecessary —
 # A.3's silhouette renders are plain triangle rasterisation in numpy/skimage.
+
+# --- facade openings 3-D (perception/openings_3d.py) ---
+pygltflib>=1.16
+rtree>=1.2                      # trimesh.ray.intersects_location

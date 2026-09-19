@@ -26,3 +26,6 @@ scikit-learn>=1.5               # confidence/train.py — the gate is trained on
 #     Section 6.3's top-down occupancy grid is trimesh + numpy + skimage.draw.polygon.
 #   torch / transformers   — perception runs on the other machine.
 #   geopandas / buildingregulariser — only for 4.3 regularisation. Add if needed.
+
+pygltflib>=1.16               # perception/openings_3d.py: per-node extras on the exported glb
+rtree>=1.2                     # trimesh.ray (intersects_location) needs it; without it ray-casting raises
