@@ -17,6 +17,12 @@ scikit-image>=0.24
 opencv-python-headless>=4.10
 pillow>=10.3
 
+# --- to run pipeline.py end to end on this machine too ---
+replicate>=0.32                 # FLUX Kontext + TRELLIS (generate/)
+requests>=2.32
+python-dotenv>=1.0
+pillow-heif>=1.7                # iPhone HEIC photos
+
 # --- section A: segmentation + silhouette scoring ---
 transformers>=4.44              # Grounding DINO and SAM 2 are both supported here
 accelerate>=0.33

@@ -11,6 +11,7 @@ scikit-image>=0.24              # marching squares (6.3), morphology, polygon ra
 opencv-python-headless>=4.10    # minAreaRect (4.4). headless = no Qt conflict
 matplotlib>=3.9                 # the 9.3 overlay PNG
 pillow>=10.3                    # image I/O + EXIF (6.6 Filter 2)
+pillow-heif>=1.7                # iPhone HEIC -> JPEG for the photo walk
 requests>=2.32                  # Overpass, Nominatim
 python-dotenv>=1.0
 replicate>=0.32                 # section 5 generation

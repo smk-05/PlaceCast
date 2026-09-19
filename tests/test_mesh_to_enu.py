@@ -117,3 +117,29 @@ def test_record_entry_column_major_is_the_transpose():
     e = placement.record_entry(m, "gltf_scene")
     assert e["rows"][0] == [0, 1, 2, 3]
     assert e["column_major"][:4] == [0, 4, 8, 12]   # first COLUMN
+
+
+def test_record_facade_heading_uses_the_refined_rotation():
+    """Owen's openings inherit this bearing: fitted theta + front normal."""
+    import math
+
+    import numpy as np
+
+    from geo.coords import theta_to_heading
+    from geo.fit import ombb_candidates, solve
+    from pipeline import _facade_entry
+    from tests.test_fit_synthetic import RECT, _fp, _mo
+
+    fp = _fp(RECT)
+    mo = _mo(RECT / 30.0, front_angle=-math.pi / 2)
+    chosen = ombb_candidates(fp, mo)[0][0]
+    fit = solve(fp, mo, chosen=chosen)
+    entry = _facade_entry(fp, mo, chosen, fit, "photographed_side", lambda *_: None)
+    expected = math.degrees(theta_to_heading(fit.theta - math.pi / 2))
+    assert entry["front_heading_deg"] == np.float64(expected) or \
+        abs(entry["front_heading_deg"] - expected) < 1e-9
+    assert entry["front_source"] == "photographed_side"
+
+    no_front = _mo(RECT / 30.0)
+    assert _facade_entry(fp, no_front, chosen, fit, "gltf_prior",
+                         lambda *_: None)["front_heading_deg"] is None

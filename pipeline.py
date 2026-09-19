@@ -125,8 +125,12 @@ def run(address: str,
     # Replaces the glTF "+Z is the front" ASSUMPTION with evidence, when there is
     # any. Must precede disambiguation: EXIF and road-normal both match a bearing
     # to the front facade.
+    front_source = "unknown" if mo.front_angle is None else "gltf_prior"
     if mesh_vertices is not None:
+        prior_front = mo.front_angle
         mo = _front_from_photo(mo, run_dir / "mesh.glb", photo_ev, log)
+        if mo.front_angle is not None and mo.front_angle != prior_front:
+            front_source = "photographed_side"
 
     # -- A.3 silhouette render-and-compare: after M_0 and the 6.4 check, before 6.6 ----
     photo_ev = _attach_silhouette_evidence(
@@ -243,6 +247,7 @@ def run(address: str,
 
     record_dict = record.to_json_dict()
     record_dict["mesh_to_enu"] = placement.record_entry(m2e, frame_name)
+    record_dict["facade"] = _facade_entry(fp, mo, chosen, result, front_source, log)
 
     record_path = run_dir / "record.json"
     record_path.write_text(json.dumps(record_dict, indent=2, default=str),
@@ -389,6 +394,31 @@ def _attach_silhouette_evidence(photo_ev, mo, mesh_glb, tags, fp, perception, lo
     log(f"silhouette[{perception}]: " + " ".join(f"{c}={s:.3f}" for c, s in scores.items())
         + f" margin={margin:.3f} decides={photo_ev.has_silhouette_evidence}")
     return photo_ev
+
+
+def _facade_entry(fp, mo, chosen, result, front_source, log) -> dict:
+    """World bearing of the FRONT facade's outward normal, for anything placed on
+    it (Owen's door/window openings inherit it). Uses the REFINED rotation
+    (FitResult.theta), not the OMBB candidate's closed form.
+
+    front_source says what the "front" is: "photographed_side" when Owen's
+    photographed_side() read it off a real mask (then this is the bearing of
+    the facade in the photo), "gltf_prior" when it is the glTF +Z convention
+    alone, "unknown" (bearing None) when there is no front at all — a dry-run
+    box has none, and no default is substituted.
+    """
+    try:
+        heading = disambiguate.facade_heading(fp, mo, chosen, theta=result.theta)
+    except ValueError:
+        heading = None
+    if heading is not None:
+        log(f"facade: front faces {heading:.1f} deg (from {front_source})")
+    return {
+        "front_heading_deg": heading,
+        "front_source": front_source if heading is not None else "unknown",
+        "front_angle_canonical_rad": mo.front_angle,
+        "convention": "compass degrees clockwise from true north, outward normal",
+    }
 
 
 def _generation_input(photo, photo_ev, run_dir, log, *, use_mask):

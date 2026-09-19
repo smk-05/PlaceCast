@@ -82,10 +82,10 @@ def edit_image(image_path: Path, prompt: str, out_path: Path,
             "it in — see the hour-0 account list."
         )
 
-    import replicate
+    from generate import throttle
 
     with open(image_path, "rb") as f:
-        output = replicate.run(
+        output = throttle.run(
             MODEL,
             input={
                 "input_image": f,

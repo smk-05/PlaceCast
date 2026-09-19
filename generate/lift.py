@@ -65,16 +65,15 @@ def lift_to_mesh(image_paths: list[Path], out_path: Path,
             "hour-0 account list."
         )
 
-    import replicate
+    from generate import throttle
 
     handles = [open(p, "rb") for p in image_paths]
     try:
-        payload = {**merged}
-        if len(handles) == 1:
-            payload["images"] = [handles[0]]
-        else:
-            payload["images"] = handles
-        output = replicate.run(MODEL, input=payload)
+        # The PINNED version's schema requires `images` (an array), verified
+        # against the live API 2026-09-19. A 422 "image is required" means a
+        # different, unpinned version is being called, not that this is wrong.
+        payload = {**merged, "images": handles}
+        output = throttle.run(MODEL, input=payload)
     finally:
         for h in handles:
             h.close()

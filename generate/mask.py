@@ -29,7 +29,8 @@ from PIL import Image, ImageOps
 from scipy import ndimage
 
 BACKGROUND = (255, 255, 255)
-DILATE_FRAC = 0.006    # of the image diagonal: keeps cornices SAM shaved off
+DILATE_FRAC = 0.003    # of the image diagonal: keeps cornices SAM shaved off;
+                       # 0.006 left a visible sky halo on 24 MP phone photos
 CROP_MARGIN = 0.12     # of the mask bbox's larger side, on every edge
 MIN_MASK_FRAC = 0.02   # below this the mask is not a building; refuse
 MAX_SIDE_PX = 2048     # FLUX returns ~1 MP and TRELLIS runs at 518 px; a
@@ -50,8 +51,11 @@ def prepare_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
         raise MaskError(f"mask covers {m.mean():.1%} of the frame; not a building")
     m = ndimage.binary_fill_holes(m)
     r = max(1, int(round(DILATE_FRAC * float(np.hypot(*shape)))))
-    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
-    return ndimage.binary_dilation(m, structure=(xx * xx + yy * yy) <= r * r)
+    # cv2, not scipy: a 43 px disk on a 24 MP phone mask took minutes in
+    # ndimage.binary_dilation and is ~0.1 s here.
+    import cv2
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    return cv2.dilate(m.astype(np.uint8), kernel) > 0
 
 
 def square_crop_box(m: np.ndarray, margin: float = CROP_MARGIN) -> tuple[int, int, int, int]:
