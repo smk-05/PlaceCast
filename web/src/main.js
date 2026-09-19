@@ -161,9 +161,9 @@ function addPolygon(rings, { height, extrudedHeight, colour, outlineColour }) {
         color: Cesium.ColorGeometryInstanceAttribute.fromColor(outlineColour),
       },
     }),
-    appearance: new Cesium.PerInstanceColorAppearance({
-      flat: true, translucent: false, renderState: { lineWidth: 2 },
-    }),
+    // No renderState.lineWidth: WebGL on Windows allows 1 only, and anything
+    // else is a hard DeveloperError that stops rendering outright.
+    appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: false }),
     asynchronous: false,
   }));
 }
