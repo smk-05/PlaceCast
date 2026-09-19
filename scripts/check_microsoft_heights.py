@@ -106,6 +106,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true",
                     help="check every building, not just the OSM-untagged ones")
+    ap.add_argument("--out", type=Path, default=CACHE / "matched_footprints.geojson",
+                    help="where to write matched Microsoft polygons. Defaults to the "
+                         "gitignored cache; pass fixtures/microsoft/matched_footprints."
+                         "geojson explicitly to update the COMMITTED fixture")
     args = ap.parse_args()
 
     addresses = list(dict.fromkeys(DEMO + BENCHMARK))
@@ -190,11 +194,15 @@ def main() -> int:
     print(f"\nMicrosoft supplies a height for {hits}/{len(targets)} "
           f"{'buildings' if args.all else 'OSM-untagged buildings'}.")
 
-    FIXTURE.mkdir(parents=True, exist_ok=True)
-    out = FIXTURE / "matched_footprints.geojson"
+    # Never overwrite the committed fixture by default: an --all run used to
+    # silently replace it with every building's polygons.
+    out = args.out.resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({"type": "FeatureCollection", "features": subset}),
                    encoding="utf-8")
-    print(f"Matched subset written to {out.relative_to(ROOT)} (commit it).")
+    committed = out.is_relative_to(FIXTURE.resolve())
+    print(f"Matched subset written to {out}"
+          + ("  <- the COMMITTED fixture; review the diff before committing" if committed else ""))
     return 0
 
 

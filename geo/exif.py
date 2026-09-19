@@ -70,11 +70,14 @@ def extract(image_path: Path) -> dict:
             g = {ExifTags.GPSTAGS.get(k, k): v for k, v in gps.items()}
 
             heading = _ratio(g.get("GPSImgDirection"))
-            if heading is not None:
+            # EXIF defines GPSImgDirection as 0.00-359.99. Out-of-range or NaN is
+            # corrupt data: drop it rather than wrap it (400 % 360 = 40 would
+            # turn garbage into a confident-looking bearing).
+            if heading is not None and heading == heading and 0.0 <= heading < 360.0:
                 # GPSImgDirectionRef is "T" (true) or "M" (magnetic). We do not
                 # correct for declination — it is ~10 deg in Virginia, well
                 # inside the 90 deg bins this cue has to discriminate between.
-                out["heading_deg"] = heading % 360.0
+                out["heading_deg"] = heading
 
             pitch = _ratio(g.get("GPSPitch")) or _ratio(named.get("CameraElevationAngle"))
             if pitch is not None:

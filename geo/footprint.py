@@ -64,7 +64,26 @@ def geocode(address: str, *, use_cache: bool = True) -> dict:
     return result
 
 
+NOMINATIM_MIN_INTERVAL_S = 1.0   # Nominatim usage policy: max 1 request/second
+_last_nominatim_call = 0.0
+
+
+def _throttle_nominatim() -> None:
+    """Block until 1 s has passed since the previous Nominatim request.
+
+    The public server's usage policy caps clients at one request per second and
+    bans those that exceed it. Only live requests pass through here — cache hits
+    in geocode() return before this is reached.
+    """
+    global _last_nominatim_call
+    wait = NOMINATIM_MIN_INTERVAL_S - (time.monotonic() - _last_nominatim_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_nominatim_call = time.monotonic()
+
+
 def _geocode_nominatim(address: str) -> dict:
+    _throttle_nominatim()
     r = requests.get(
         NOMINATIM_URL,
         params={"q": address, "format": "jsonv2", "limit": 1, "polygon_geojson": 0},
@@ -386,6 +405,32 @@ def select_footprint(payload: dict, lat: float, lon: float,
         chosen, quality = in_range[0], "unnamed_sole_candidate"
 
     if chosen is None:
+        # Split buildings: "Hahn Hall" is two OSM buildings, "Hahn Hall North"
+        # and "Hahn Hall South", and the geocoder lands on neither (a bus stop on
+        # Drillfield Drive). Merging them would fit one photo's mesh to two
+        # buildings, so this stays a failure — but it names the parts, so the
+        # fix is one retyped address rather than an OSM investigation.
+        siblings = _split_building_parts(buildings, address)
+        if siblings:
+            # The parts can straddle the search radius (Hahn Hall North is 55 m
+            # out, just beyond it), and naming only one part implies there is
+            # only one. Look wider — cached like every other Overpass call.
+            try:
+                wider = fetch_osm(lat, lon, radius=SPLIT_SEARCH_RADIUS_M)
+                wide_buildings = [(el, _element_to_polygon(el))
+                                  for el in wider.get("elements", [])
+                                  if "building" in (el.get("tags") or {})]
+                siblings = sorted(set(siblings) | set(_split_building_parts(wide_buildings, address)))
+            except RuntimeError:
+                pass  # Overpass down: report the parts we can see
+            siblings = sorted(siblings)
+            raise LookupError(
+                f"{address!r} is split into separate OSM buildings: "
+                + ", ".join(repr(s) for s in siblings)
+                + ". A photo shows one of them — re-run with the specific name, "
+                f"e.g. --address \"{siblings[0]}, {_address_tail(address)}\" "
+                "(spec 10.2 failure 3)."
+            )
         names = sorted({(el.get("tags") or {}).get("name", "?") for el, _ in in_range})
         raise LookupError(
             f"Ambiguous footprint for {address!r} at ({lat:.5f}, {lon:.5f}): "
@@ -400,6 +445,39 @@ def select_footprint(payload: dict, lat: float, lon: float,
     chosen[0]["_match_quality"] = quality
     neighbours = [p for el, p in buildings if el is not chosen[0]]
     return chosen[0], chosen[1], neighbours
+
+
+SPLIT_SEARCH_RADIUS_M = 200
+
+
+def _query_building_name(address: str) -> str:
+    """'Hahn Hall, Blacksburg, VA' -> 'hahn hall'."""
+    return address.split(",", 1)[0].strip().lower()
+
+
+def _address_tail(address: str) -> str:
+    """'Hahn Hall, Blacksburg, VA' -> 'Blacksburg, VA'."""
+    parts = address.split(",", 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _split_building_parts(buildings, address: str) -> list[str]:
+    """Names of OSM buildings that are PARTS of the queried name.
+
+    A part is a building whose name starts with the full query name followed by
+    more words ("Hahn Hall" -> "Hahn Hall North"). Requiring the whole query as
+    a prefix keeps "Hall" from matching every hall on campus.
+    """
+    query = _query_building_name(address)
+    if len(query) < 4:
+        return []
+    parts = set()
+    for el, _ in buildings:
+        name = ((el.get("tags") or {}).get("name") or "").strip()
+        low = name.lower()
+        if low.startswith(query + " ") and len(low) > len(query) + 1:
+            parts.add(name)
+    return sorted(parts)
 
 
 def _distance_m(geom, pt) -> float:

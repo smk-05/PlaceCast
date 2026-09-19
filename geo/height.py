@@ -16,6 +16,7 @@ Priority order, and ALWAYS record which tier fired:
 from __future__ import annotations
 
 import math
+import re
 
 from contracts import HeightSource
 
@@ -29,17 +30,42 @@ MAX_HEIGHT_M = 300.0
 SLENDERNESS_RANGE = (0.1, 8.0)
 
 
+FT_TO_M = 0.3048
+_LENGTH_RE = re.compile(
+    r"""^\s*(?:
+        (?P<ft>\d+(?:\.\d+)?)\s*'\s*(?:(?P<inch>\d+(?:\.\d+)?)\s*"\s*)?   # 25'6"  82'
+      | (?P<num>\d+(?:[.,]\d+)?)\s*(?P<unit>m|metres?|meters?|ft|feet|foot)?  # 20.7  20.7 m  82 ft
+    )\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def parse_osm_length(raw) -> float | None:
+    """An OSM length tag -> metres, or None if it cannot be read unambiguously.
+
+    OSM's convention is metres unless a unit says otherwise, and imperial values
+    are legal: "82 ft", "82'", "25'6\"". Reading "82 ft" as 82 m made a building
+    3.3x too tall, silently. Anything unparseable returns None so the priority
+    chain falls through rather than guessing.
+    """
+    if raw is None:
+        return None
+    m = _LENGTH_RE.match(str(raw))
+    if not m:
+        return None
+    if m.group("ft") is not None:
+        feet = float(m.group("ft")) + float(m.group("inch") or 0) / 12.0
+        return feet * FT_TO_M
+    value = float(m.group("num").replace(",", "."))
+    unit = (m.group("unit") or "m").lower()
+    return value * FT_TO_M if unit in ("ft", "feet", "foot") else value
+
+
 def from_osm_tags(tags: dict) -> tuple[float, HeightSource] | None:
     """OSM `height` is definitive when present; `building:levels` is next."""
-    raw = (tags or {}).get("height")
-    if raw is not None:
-        try:
-            # Values arrive as "20.7", "20.7 m", occasionally with junk.
-            v = float(str(raw).strip().split()[0].replace("m", ""))
-            if MIN_HEIGHT_M <= v <= MAX_HEIGHT_M:
-                return v, HeightSource.OSM_HEIGHT
-        except (ValueError, IndexError):
-            pass
+    v = parse_osm_length((tags or {}).get("height"))
+    if v is not None and MIN_HEIGHT_M <= v <= MAX_HEIGHT_M:
+        return v, HeightSource.OSM_HEIGHT
 
     raw = (tags or {}).get("building:levels")
     if raw is not None:

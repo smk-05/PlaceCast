@@ -118,6 +118,13 @@ def run(address: str,
         mo = outline.outline_from_footprint(fp)
         log("outline: STUB (footprint OMBB) — a plain box, the hour-6 milestone object")
 
+    # -- A.3: which side of the mesh the photo shows -> MeshOutline.front_angle --
+    # Replaces the glTF "+Z is the front" ASSUMPTION with evidence, when there is
+    # any. Must precede disambiguation: EXIF and road-normal both match a bearing
+    # to the front facade.
+    if mesh_vertices is not None:
+        mo = _front_from_photo(mo, run_dir / "mesh.glb", photo_ev, log)
+
     # -- A.3 silhouette render-and-compare: after M_0 and the 6.4 check, before 6.6 ----
     photo_ev = _attach_silhouette_evidence(
         photo_ev, mo, run_dir / "mesh.glb" if mesh_vertices is not None else None,
@@ -169,12 +176,18 @@ def run(address: str,
         log(f"  note: {n}")
 
     # -- 9.1 the gate --------------------------------------------------------
-    from confidence.gate import score_confidence_verbose
-    score, decision, gate_reasons = score_confidence_verbose(
-        result, photo_ev, fp, method=confidence_method
-    )
+    from confidence.gate import evaluate_gate
+    gate = evaluate_gate(result, photo_ev, fp, method=confidence_method)
+    score, decision, gate_reasons = gate.score, gate.decision, list(gate.reasons)
+    # Record the method that RAN. "learned" falls back to the table when no
+    # trained model exists; logging the request would claim a model decided.
+    method_ran = gate.method
     all_reasons = reasons + gate_reasons
-    log(f"decision: {decision.value} (score {score:.3f}, {confidence_method})")
+    log(f"decision: {decision.value} (score {score:.3f}, method ran: {method_ran}"
+        + (f", requested {gate.requested_method}" if gate.requested_method != method_ran else "")
+        + ")")
+    if gate.fallback_reason:
+        log(f"  gate fallback: {gate.fallback_reason}")
     for r in gate_reasons:
         log(f"  {r}")
 
@@ -207,7 +220,7 @@ def run(address: str,
         fit=result,
         decision=decision,
         confidence_p=score,
-        confidence_method=confidence_method,
+        confidence_method=method_ran,
         review_reasons=tuple(all_reasons),
     )
 
@@ -269,6 +282,56 @@ def _build_photo_evidence(photos, perception, run_dir, log):
         exif_gps=meta["gps"],
         segmentation_model=seg["segmentation_model"],
     )
+
+
+# Addendum A.3: the silhouette decides only above this margin.
+FRONT_FROM_PHOTO_MIN_MARGIN = 0.08
+
+
+def _front_from_photo(mo, mesh_glb, photo_ev, log):
+    """Set MeshOutline.front_angle from perception's photographed_side().
+
+    The photographed facade faces the camera, so the side the photo shows IS the
+    facade EXIF and the road prior must match. Without this, front_angle is the
+    glTF convention's guess (front = +Z), which TRELLIS does not guarantee.
+
+    The side index is turned into an angle via the camera direction itself,
+    rotated into the canonical frame by the same rotation canonicalisation used
+    — so it holds for any up-axis, not only glTF's +Y.
+
+    Abstains (keeps the prior) unless the mask came from the REAL segmenter —
+    the stub's central box carries no shape — and the margin clears A.3's 0.08.
+    """
+    from dataclasses import replace
+
+    if not photo_ev.segmentation_model.startswith("real:"):
+        log(f"front: glTF prior kept (mask from {photo_ev.segmentation_model}, "
+            "which carries no shape evidence)")
+        return mo
+    if not Path(mesh_glb).is_file():
+        return mo
+
+    import trimesh
+
+    from perception.render_compare import camera_basis, photographed_side
+
+    up = outline.UP_AXIS_CANDIDATES[mo.up_axis_idx]
+    mesh = trimesh.load(str(mesh_glb), force="scene")
+    side = photographed_side(mesh, photo_ev.mask, up_axis=tuple(up))
+
+    if side.margin < FRONT_FROM_PHOTO_MIN_MARGIN:
+        log(f"front: glTF prior kept (photographed-side margin {side.margin:.3f} "
+            f"< {FRONT_FROM_PHOTO_MIN_MARGIN})")
+        return mo
+
+    _, _, toward = camera_basis(up, side.index * np.pi / 2)
+    t = outline.canonical_rotation(mo.up_axis_idx) @ toward
+    angle = float(np.arctan2(t[1], t[0]))
+    prior = mo.front_angle
+    log(f"front: photo shows mesh side {side.index} (margin {side.margin:.3f}); "
+        f"front_angle {np.degrees(angle):.0f} deg"
+        + ("" if prior is None else f" (glTF prior was {np.degrees(prior):.0f} deg)"))
+    return replace(mo, front_angle=angle)
 
 
 def _attach_silhouette_evidence(photo_ev, mo, mesh_glb, tags, fp, perception, log, *, has_photo):
@@ -337,12 +400,27 @@ def _to_enu_polygon(poly_lonlat, frame):
     return p if p.is_valid else p.buffer(0)
 
 
+# Streets a facade can face. Spec 6.6 Filter 3 says highway=*, but on a campus
+# that is mostly footpaths: near NCB 67 of 90 highway ways were path, footway,
+# steps or cycleway, and near Burruss 138 of 139 were not streets at all. Every
+# wall has a sidewalk beside it, so "nearest highway" pointed at an arbitrary
+# side. Only roads a building actually addresses count.
+STREET_HIGHWAYS = {
+    "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified",
+    "residential", "living_street", "service",
+    "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
+}
+EXCLUDED_SERVICE = {"parking_aisle", "drive-through", "emergency_access"}
+
+
 def _roads_to_enu(payload, frame) -> list[np.ndarray]:
-    """highway=* ways in ENU, for spec 6.6 Filter 3's street-facing prior."""
+    """Street ways in ENU, for spec 6.6 Filter 3's street-facing prior."""
     out = []
     for el in payload.get("elements", []):
         tags = el.get("tags") or {}
-        if "highway" not in tags or not el.get("geometry"):
+        if tags.get("highway") not in STREET_HIGHWAYS or not el.get("geometry"):
+            continue
+        if tags.get("service") in EXCLUDED_SERVICE:
             continue
         arr = np.array([[p["lon"], p["lat"]] for p in el["geometry"]])
         enu = np.asarray(frame.geodetic_to_enu(arr[:, 1], arr[:, 0], 0.0))[:, :2]

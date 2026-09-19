@@ -268,10 +268,14 @@ grid in numpy, and the overlay is matplotlib.
   SYNTHETIC rows only (`fixtures/fake_fits.py`); `model.json` says so and `gate.py` refuses to
   use it. It needs the real spec 11 benchmark rows. Until a real model exists, `--confidence
   learned` falls back to the threshold table and records that in the review reasons.
-- Perception runs the REAL models by default (Grounding DINO + SAM 2). Set
-  `PROCEDURA_PERCEPTION=stub` for the non-ML stand-ins on a machine without a GPU; the test
-  suite does this in `tests/conftest.py`. `pipeline.py`'s own `--perception` flag does not reach
-  `perception/` yet, so the environment variable is the switch.
+- Perception runs the REAL models by default (Grounding DINO + SAM 2) when a caller names no
+  backend. `pipeline.py` always names one: its `--perception` flag (default `stub`) is passed
+  through to `perception/` and beats `PROCEDURA_PERCEPTION`, and the record shows the backend
+  that actually ran. Run `--perception real` only on a machine with the ML stack. The test
+  suite forces the stub in `tests/conftest.py`.
+- With a real segmentation mask, the photographed side of the mesh sets
+  `MeshOutline.front_angle` (margin ≥ 0.08); otherwise the glTF "front is +Z" convention is
+  assumed. The EXIF and road-normal cues both depend on it.
 - `score_silhouettes` is flat across `azimuth_k` on purpose (see `tests/test_azimuth_contract.py`):
   a silhouette of the mesh front cannot depend on which quarter-turn the placed mesh gets.
 - `geo/terrain.py` uses USGS 3DEP (orthometric, needs the geoid correction).

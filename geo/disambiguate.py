@@ -70,18 +70,49 @@ def azimuth_from_exif(photo: PhotoEvidence,
 
     Prefers the camera GPS fix (a true bearing to the building) and falls back
     to the recorded compass heading (where the camera was pointed).
+
+    Invalid input ABSTAINS (returns None), never wraps or propagates. This is
+    the strongest cue in the pipeline and it overrides everything below it, so a
+    NaN or an out-of-range value must not be allowed to decide an orientation.
     """
-    if photo.exif_gps is not None:
-        cam_lat, cam_lon = photo.exif_gps
+    gps = photo.exif_gps
+    if gps is not None and _valid_camera_fix(gps, building_lat, building_lon):
+        cam_lat, cam_lon = gps
         d_north = (building_lat - cam_lat) * 111_320.0
         d_east = (building_lon - cam_lon) * 111_320.0 * math.cos(math.radians(cam_lat))
         if math.hypot(d_north, d_east) > 2.0:
             return math.atan2(d_north, d_east)
 
-    if photo.exif_heading_deg is not None:
+    h = photo.exif_heading_deg
+    if h is not None and _finite(h) and 0.0 <= h < 360.0:
         # Compass heading (CW from North) -> mathematical theta (CCW from East).
-        return math.radians(90.0 - photo.exif_heading_deg)
+        return math.radians(90.0 - h)
     return None
+
+
+# A street photo is taken from across the road, not from another town. A fix
+# farther than this is stale or wrong (a phone that has not re-acquired GPS
+# indoors reports its last position), so it is ignored rather than trusted.
+MAX_CAMERA_DISTANCE_M = 1000.0
+
+
+def _finite(x) -> bool:
+    try:
+        return math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_camera_fix(gps, building_lat, building_lon) -> bool:
+    try:
+        lat, lon = gps
+    except (TypeError, ValueError):
+        return False
+    if not (_finite(lat) and _finite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+        return False
+    d_north = (building_lat - lat) * 111_320.0
+    d_east = (building_lon - lon) * 111_320.0 * math.cos(math.radians(lat))
+    return math.hypot(d_north, d_east) <= MAX_CAMERA_DISTANCE_M
 
 
 # --------------------------------------------------------------------------
