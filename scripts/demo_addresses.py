@@ -8,9 +8,8 @@ rectilinearity R should come in low and the pipeline should flag it for review
 rather than confidently placing it wrong. Demonstrating that is worth more than
 a fifth clean success.
 
-BENCHMARK: spec 11's twenty buildings across four strata — five rectangular,
-five L-shaped or complex, five near-square, five on sloped ground. Include
-buildings the judges will recognise.
+BENCHMARK: spec 11's twenty buildings, stratified by MEASURED shape
+(rectangular / complex / near-square) — see the comment above the lists.
 """
 
 # MEASURED values, from scripts/prefetch_footprints.py against live OSM on
@@ -45,50 +44,52 @@ DEMO = [
 #   Goodwin      clean rectilinear control, and a plain way rather than a
 #                relation, so it isolates solver bugs from parsing bugs.
 
-# Spec 11's four strata. Hand-annotate ground truth for each by manually
-# aligning a reference box; the resulting rows are also addendum B's training
-# set (20 buildings x 4 ablation configs = 80 labelled placements).
+# Spec 11's strata, assigned from MEASURED shape (scripts/run_benchmark.py,
+# 2026-09-19), not from building names. The name-based guesses were wrong for
+# 8 of 20: McBryde (R 0.249 — non-orthogonal wings, not a rectangle), Newman
+# (R 0.425), Lane Stadium (R 0.393) are complex; Goodwin, Davidson, Robeson,
+# Hutcheson and Patton are NOT near-square (aspect 1.24-2.87); Holden and War
+# Memorial are. The rule, applied in this order:
+#     complex      R < 0.85
+#     near_square  aspect < 1.15   (spec says 1.1; only Newman clears that,
+#                                   and it is already complex)
+#     rectangular  everything else
+# run_benchmark.measured_stratum() applies the same rule at run time, so a
+# changed footprint re-stratifies itself instead of silently mislabelling.
 #
-# CAVEAT: these stratum assignments are guesses from building names, and the
-# demo set already proved two such guesses wrong. Before the hour-30 benchmark
-# run, verify each one against its MEASURED aspect and R — "near-square" means
-# aspect < 1.1, "complex" means R below about 0.85 — and move buildings between
-# strata accordingly. A stratum that does not actually contain near-square
-# buildings tests nothing.
+# "Sloped" is NOT a footprint property — slope only affects terrain height,
+# which the 2D benchmark does not exercise. SLOPED_SITES is kept as a tag for
+# the terrain check; the slopes themselves are unverified.
 BENCHMARK_RECTANGULAR = [
-    "Burruss Hall, Blacksburg, VA",
-    "McBryde Hall, Blacksburg, VA",
-    # Randolph Hall removed: it is DEMOLISHED. OSM now carries "Randolph Hall
-    # Demolition, Mitchell Hall Construction" at that point and no building
-    # polygon, so the selection rule correctly refuses it. That is a bad
-    # benchmark entry, not a solver failure — benchmarking it would measure
-    # nothing. Verified live 2026-09-19.
-    "Major Williams Hall, Blacksburg, VA",
-    "Whittemore Hall, Blacksburg, VA",
-    "Hancock Hall, Blacksburg, VA",
+    "Burruss Hall, Blacksburg, VA",          # R 1.000  aspect 1.44
+    "Major Williams Hall, Blacksburg, VA",   # 0.964  1.31  (Randolph: demolished)
+    "Whittemore Hall, Blacksburg, VA",       # 1.000  1.86
+    "Hancock Hall, Blacksburg, VA",          # 0.882  1.77
+    "Torgersen Hall, Blacksburg, VA",        # 0.919  2.42
+    "Goodwin Hall, Blacksburg, VA",          # 0.999  1.26
+    "Davidson Hall, Blacksburg, VA",         # 0.878  1.46
+    "Robeson Hall, Blacksburg, VA",          # 0.999  1.64
+    "Hutcheson Hall, Blacksburg, VA",        # 1.000  1.24
+    "Patton Hall, Blacksburg, VA",           # 0.997  2.87  (Femoyer: not geocodable)
+    "Cassell Coliseum, Blacksburg, VA",      # 1.000  1.34
+    "Derring Hall, Blacksburg, VA",          # 1.000  3.10
+    "Price Hall, Blacksburg, VA",            # 1.000  2.35
 ]
 
 BENCHMARK_COMPLEX = [
-    "Torgersen Hall, Blacksburg, VA",
-    "Squires Student Center, Blacksburg, VA",
-    "Newman Library, Blacksburg, VA",
-    "Durham Hall, Blacksburg, VA",
-    "Holden Hall, Blacksburg, VA",
+    "McBryde Hall, Blacksburg, VA",          # 0.249  1.13
+    "Newman Library, Blacksburg, VA",        # 0.425  1.06  courtyard
+    "Lane Stadium, Blacksburg, VA",          # 0.393  2.24  multi-part (4 stands)
+    "Squires Student Center, Blacksburg, VA",  # 0.787  1.90
+    "Durham Hall, Blacksburg, VA",           # 0.826  2.80
 ]
 
 BENCHMARK_NEAR_SQUARE = [
-    "Goodwin Hall, Blacksburg, VA",
-    "Davidson Hall, Blacksburg, VA",
-    "Robeson Hall, Blacksburg, VA",
-    "Hutcheson Hall, Blacksburg, VA",
-    "Patton Hall, Blacksburg, VA",   # was Femoyer Hall — Nominatim cannot resolve it
+    "Holden Hall, Blacksburg, VA",           # 0.997  1.11
+    "War Memorial Hall, Blacksburg, VA",     # 1.000  1.14
 ]
 
-BENCHMARK_SLOPED = [
-    # Lane Stadium is also the MULTI-PART case: relation/2417911 is four
-    # disjoint outer rings (the stands) with the field as a genuine gap, so the
-    # geocoded point is honestly not contained by the footprint. Keep it — it is
-    # the only benchmark entry exercising MultiPolygon handling.
+SLOPED_SITES = [
     "Lane Stadium, Blacksburg, VA",
     "Cassell Coliseum, Blacksburg, VA",
     "War Memorial Hall, Blacksburg, VA",
@@ -100,12 +101,10 @@ BENCHMARK = (
     BENCHMARK_RECTANGULAR
     + BENCHMARK_COMPLEX
     + BENCHMARK_NEAR_SQUARE
-    + BENCHMARK_SLOPED
 )
 
 STRATA = {
     "rectangular": BENCHMARK_RECTANGULAR,
     "complex": BENCHMARK_COMPLEX,
     "near_square": BENCHMARK_NEAR_SQUARE,
-    "sloped": BENCHMARK_SLOPED,
 }
