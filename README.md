@@ -264,9 +264,16 @@ grid in numpy, and the overlay is matplotlib.
 
 ## Known gaps
 
-- `confidence/features.py` and `confidence/train.py` are the perception
-  contributor's deliverable; `gate.py` falls back to the threshold table
-  cleanly when they are absent.
+- The learned gate exists (`confidence/features.py`, `train.py`, `gate.py`) but is trained on
+  SYNTHETIC rows only (`fixtures/fake_fits.py`); `model.json` says so and `gate.py` refuses to
+  use it. It needs the real spec 11 benchmark rows. Until a real model exists, `--confidence
+  learned` falls back to the threshold table and records that in the review reasons.
+- Perception runs the REAL models by default (Grounding DINO + SAM 2). Set
+  `PROCEDURA_PERCEPTION=stub` for the non-ML stand-ins on a machine without a GPU; the test
+  suite does this in `tests/conftest.py`. `pipeline.py`'s own `--perception` flag does not reach
+  `perception/` yet, so the environment variable is the switch.
+- `score_silhouettes` is flat across `azimuth_k` on purpose (see `tests/test_azimuth_contract.py`):
+  a silhouette of the mesh front cannot depend on which quarter-turn the placed mesh gets.
 - `geo/terrain.py` uses USGS 3DEP (orthometric, needs the geoid correction).
   The viewer's Cesium World Terrain path is already ellipsoidal and is primary.
 - Benchmark strata in `scripts/demo_addresses.py` are guesses from building

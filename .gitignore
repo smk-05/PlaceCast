@@ -20,3 +20,6 @@ photos/
 # The footprint cache IS committed — it is small, and it is what saves the demo
 # when Overpass rate-limits mid-judging (spec 3.2, failure mode 12).
 !fixtures/footprints/
+
+# Generated artifacts (confidence/train.py, perception/segment.py outputs)
+outputs/
