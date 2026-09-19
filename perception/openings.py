@@ -90,6 +90,12 @@ CONTAIN_AREA_RATIO = 0.50       # ... and inner area under this * outer area: th
 GARAGE_MIN_SCORE = 0.35         # a garage door needs a raw DINO garage score of at least this ...
 GARAGE_MIN_LEAD = 0.10          # ... and this much above the raw door score, else it is a "recess"
 
+# occlusion and window columns
+OCCLUDERS = ("lamp", "column", "sign")   # things that stand IN FRONT of an opening
+OCCLUSION_RATIO = 1.3           # an occluder replaces the opening's type only if it scores this * the best opening class
+COLUMN_WIDTH_TOL = 0.20         # a window above counts if its width is within +/- this of the opening's ...
+COLUMN_OVERLAP = 0.60           # ... and it overlaps horizontally by more than this fraction of the narrower box
+
 # template gap-fill
 TEMPLATE_SCALES = tuple(round(float(s), 2) for s in np.arange(0.4, 1.101, 0.1))
 TEMPLATE_SQUEEZE = (1.0, 0.6)   # extra width factors: windows seen at an angle are narrower, not smaller
@@ -254,12 +260,37 @@ def row_peers(d, dets):
     return n
 
 
-def priors(touches, aspect, width_frac, peers):
+def window_above(d, dets):
+    """True when a same-width window sits above this box in the same column (width within COLUMN_WIDTH_TOL,
+    horizontal overlap > COLUMN_OVERLAP, and its bottom no lower than this box's top edge, give or take a
+    quarter of this box's height). "Window" here means DINO's best opening class for that box is window, so the
+    test does not depend on the classification it feeds."""
+    x0, y0, x1, y1 = d["box"]
+    w, h = x1 - x0, y1 - y0
+    widx = CLASSES.index("window")
+    for o in dets:
+        if o is d:
+            continue
+        ox0, oy0, ox1, oy1 = o["box"]
+        ow = ox1 - ox0
+        if not (1 - COLUMN_WIDTH_TOL) * w <= ow <= (1 + COLUMN_WIDTH_TOL) * w:
+            continue
+        if max(0.0, min(x1, ox1) - max(x0, ox0)) / min(w, ow) <= COLUMN_OVERLAP:
+            continue
+        if (oy0 + oy1) / 2 >= (y0 + y1) / 2 or oy1 > y0 + 0.25 * h:
+            continue
+        if int(np.argmax(o["dino"][:len(CLASSES)])) == widx:
+            return True
+    return False
+
+
+def priors(touches, aspect, width_frac, peers, column=False):
     """Soft geometric plausibility per class, in (0, 1].
 
-    `touches` is ground contact measured against the opening's own height. Two or more row peers are strong
-    evidence of a window: window prior 1.0 even at ground level, door / entrance x0.5, and a door additionally
-    needs ground contact and h/w >= 1.5 (else it all but drops out).
+    `touches` is ground contact measured against the opening's own height. Two or more row peers, or a
+    same-width window directly above (`column`), are strong evidence of a window: window prior 1.0 even at
+    ground level, door / entrance x0.5, and a door additionally needs ground contact and h/w >= 1.5 (else it
+    all but drops out).
     """
     pri = {
         "door":        (1.0 if touches else 0.3) * (1.0 if 1.5 <= aspect <= 3.5 else 0.5),
@@ -268,7 +299,7 @@ def priors(touches, aspect, width_frac, peers):
                         * (1.0 if width_frac >= 0.06 else 0.5)),
         "window":      (0.45 if touches else 1.0) * (1.0 if peers >= 1 else 0.8),
     }
-    if peers >= 2:
+    if peers >= 2 or column:
         pri["window"] = 1.0
         pri["door"] *= 0.5 if (touches and aspect >= 1.5) else 0.05
         pri["entrance"] *= 0.5
@@ -562,7 +593,7 @@ def classify(dets, mask, gray, geom):
         touches = gap_px is not None and gap_px < GROUND_TOL_BOX * bh          # relative to the opening itself
         gap = gap_px / mh if gap_px is not None else 1.0                       # legacy: relative to the facade
         peers = row_peers(d, dets)
-        pri = priors(touches, bh / bw, bw / mw, peers)
+        pri = priors(touches, bh / bw, bw / mw, peers, column=window_above(d, dets))
         feat = edge_features(gray, mask, d["box"])
         fac = edge_factors(feat)
         dino = {c: float(d["dino"][i]) for i, c in enumerate(ALL_CLASSES)}
@@ -570,12 +601,21 @@ def classify(dets, mask, gray, geom):
 
         order = sorted(ALL_CLASSES, key=comb.get, reverse=True)
         top, s1, s2 = order[0], comb[order[0]], comb[order[1]]
+        occluder = None
+        if top in OCCLUDERS:
+            best_open = max(CLASSES, key=comb.get)
+            if comb[top] < OCCLUSION_RATIO * comb[best_open]:  # not convincingly a lamp: an opening behind one
+                occluder, top = top, best_open
+                s1, s2 = comb[top], max(comb[c] for c in ALL_CLASSES if c != top)
+                order = [top] + [c for c in order if c != top]
         g_top = group_of(top)
         rival = max((c for c in ALL_CLASSES if group_of(c) != g_top), key=comb.get)
         group_margin = (s1 - comb[rival]) / s1 if s1 > 0 else 0.0
         type_margin = (s1 - s2) / s1 if s1 > 0 else 0.0
 
         reasons = []
+        if occluder:
+            reasons.append(f"partly occluded by {PHRASES[occluder]}")
         if s1 < ACCEPT_SCORE:
             reasons.append(f"weak detection: combined score {s1:.2f} < {ACCEPT_SCORE}")
         if group_margin < GROUP_MARGIN_ACCEPT:
@@ -610,6 +650,7 @@ def classify(dets, mask, gray, geom):
             # added fields
             "source": d.get("source", "dino"),
             "other_label": PHRASES[top] if g_top == "other" else None,
+            "occluded_by": PHRASES[occluder] if occluder else None,
             "gap_over_box_h": round(gap_px / bh, 4) if gap_px is not None else None,
             "touches_ground_facade": bool(gap < GROUND_TOL),
             "edge_features": {**feat, "factor": {k: round(v, 3) for k, v in fac.items()}},
@@ -692,7 +733,7 @@ def memo_path(photo, model_id):
 # only computing does. The pickled DINO outputs in the same directory are a separate, larger, machine-local cache.
 OPENINGS_CACHE_DIR = seg.CACHE_DIR.parent / "openings"
 CACHE_SCHEMA = 2
-_LOGIC = ("priors", "edge_features", "edge_factors", "classify", "apply_containment", "template_fill", "nms")
+_LOGIC = ("window_above", "priors", "edge_features", "edge_factors", "classify", "apply_containment", "template_fill", "nms")
 
 
 def config_fingerprint(model_id=None, fine=True, template=True):
