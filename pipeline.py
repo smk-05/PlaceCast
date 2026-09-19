@@ -56,7 +56,8 @@ def run(address: str,
         confidence_method: str = "threshold_table",
         allow_anisotropy: bool = False,
         seed: int = 42,
-        asset_id: str | None = None) -> PlacementRecord:
+        asset_id: str | None = None,
+        mask_for_generation: bool = True) -> PlacementRecord:
 
     asset_id = asset_id or str(uuid.uuid4())
     run_dir = DATA_DIR / asset_id
@@ -98,7 +99,9 @@ def run(address: str,
     mesh_vertices = None
     models: list[dict] = []
     if not dry_run and photos:
-        mesh_vertices, models = _generate(photos, prompt, run_dir, seed, log)
+        mesh_vertices, models = _generate(photos, prompt, run_dir, seed, log,
+                                          photo_ev=photo_ev,
+                                          use_mask=mask_for_generation)
 
     # -- 6.1-6.4 canonicalise -----------------------------------------------
     if mesh_vertices is not None:
@@ -388,12 +391,56 @@ def _attach_silhouette_evidence(photo_ev, mo, mesh_glb, tags, fp, perception, lo
     return photo_ev
 
 
-def _generate(photos, prompt, run_dir, seed, log):
+def _generation_input(photo, photo_ev, run_dir, log, *, use_mask):
+    """-> (image FLUX/TRELLIS should see, provenance dict or None). Plan 3.1.
+
+    The primary photo is cut out with its segmentation mask when that mask is
+    REAL, so TRELLIS never sees the bushes and lamp posts it would otherwise
+    turn into geometry (NCB's 12x15 m lobe). A stub mask is a central box with
+    no shape: using it would only crop, so the photo goes through unchanged.
+    Masking failure is logged and falls back to the raw photo, never aborts.
+    """
+    from generate.mask import MaskError, mask_photo
+
+    model = photo_ev.segmentation_model if photo_ev is not None else ""
+    if not use_mask:
+        log("mask: disabled (--no-mask); generating from the raw photo")
+        return Path(photo), None
+    if not model.startswith("real:"):
+        log(f"mask: not applied (mask from {model or 'nothing'} has no shape); "
+            "generating from the raw photo — scenery in front may become geometry")
+        return Path(photo), None
+
+    out = run_dir / "masked_0.png"
+    if not out.exists() and (run_dir / "edited_0.png").exists():
+        # An --asset-id re-run of a run generated WITHOUT a mask: its cached
+        # edit and mesh came from the raw photo. Keep the provenance true.
+        log("mask: not applied — this run's cached edit/mesh were generated "
+            "from the raw photo; use a new asset id to regenerate masked")
+        return Path(photo), None
+    if out.exists():
+        log(f"mask: reusing {out.name}")
+    else:
+        try:
+            mask_photo(Path(photo), photo_ev.mask, out)
+        except MaskError as exc:
+            log(f"mask: FAILED ({exc}); generating from the raw photo")
+            return Path(photo), None
+        log(f"mask: building cut out with {model} -> {out.name}")
+    return out, {"stage": "mask", "name": model, "output": out.name}
+
+
+def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=True):
     from generate.edit import edit_image
     from generate.lift import lift_to_mesh, load_vertices
 
+    # Only the primary photo has a mask (segmentation runs once, at ingest).
+    first, mask_model = _generation_input(photos[0], photo_ev, run_dir, log,
+                                          use_mask=use_mask)
+    inputs = [first, *[Path(p) for p in photos[1:]]]
+
     edited = []
-    for i, p in enumerate(photos):
+    for i, p in enumerate(inputs):
         out = run_dir / f"edited_{i}.png"
         log(f"edit: {p.name} -> {out.name}")
         edited.append(edit_image(Path(p), prompt, out, seed=seed))
@@ -403,6 +450,7 @@ def _generate(photos, prompt, run_dir, seed, log):
     glb, params = lift_to_mesh(edited, glb, seed=seed)
 
     models = [
+        *([mask_model] if mask_model else []),
         {"stage": "edit", "name": "flux-kontext-pro", "seed": seed},
         {"stage": "lift", "name": "trellis", "seed": seed, "params": params},
     ]
@@ -508,6 +556,9 @@ def main(argv=None) -> int:
     ap.add_argument("--asset-id", default=None,
                     help="re-use an existing run directory: its cached edit and "
                          "mesh are used, so no model is re-run and nothing is billed")
+    ap.add_argument("--no-mask", action="store_true",
+                    help="generate from the raw photo even when a real mask "
+                         "exists (the before/after comparison for plan 3.1)")
     args = ap.parse_args(argv)
 
     try:
@@ -515,7 +566,8 @@ def main(argv=None) -> int:
                   dry_run=args.dry_run, perception=args.perception,
                   confidence_method=args.confidence,
                   allow_anisotropy=args.anisotropy, seed=args.seed,
-                  asset_id=args.asset_id)
+                  asset_id=args.asset_id,
+                  mask_for_generation=not args.no_mask)
     except (LookupError, RuntimeError, ValueError) as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         return 1
