@@ -111,6 +111,11 @@ def run(address: str,
         mo = outline.outline_from_footprint(fp)
         log("outline: STUB (footprint OMBB) — a plain box, the hour-6 milestone object")
 
+    # -- A.3 silhouette render-and-compare: after M_0 and the 6.4 check, before 6.6 ----
+    photo_ev = _attach_silhouette_evidence(
+        photo_ev, mo, run_dir / "mesh.glb" if mesh_vertices is not None else None,
+        tags, fp, perception, log, has_photo=bool(photos))
+
     # -- 6.6 disambiguate, then 6.5-6.9 solve -------------------------------
     cands = fitmod.ombb_candidates(fp, mo)
     scored = fitmod.score_candidates(fp, mo, cands)
@@ -226,14 +231,11 @@ def _build_photo_evidence(photos, perception, run_dir, log):
     log(f"exif: heading={meta['heading_deg']} pitch={meta['pitch_deg']} "
         f"gps={meta['gps']} focal={meta['focal_mm']}")
 
-    if perception == "real":
-        from perception.segment import assess_mask, clean, segment_building
-        mask, _, _ = segment_building(primary)
-        mask = clean(mask)
-    else:
-        from perception.segment import assess_mask, clean, segment_building
-        mask, _, _ = segment_building(primary)
-        mask = clean(mask)
+    # backend=perception: the --perception flag beats $PROCEDURA_PERCEPTION, and the evidence says what ran.
+    from perception.segment import assess_mask, clean, segment_building_evidence
+    mask, _, _, seg = segment_building_evidence(primary, backend=perception)
+    mask = clean(mask)
+    log(f"segmentation: backend={seg['backend']} model={seg['segmentation_model']}")
 
     frac, occluded, note = assess_mask(mask)
     if note:
@@ -251,8 +253,45 @@ def _build_photo_evidence(photos, perception, run_dir, log):
         exif_pitch_deg=meta["pitch_deg"],
         exif_focal_mm=meta["focal_mm"],
         exif_gps=meta["gps"],
-        segmentation_model=f"{perception}:central-box",
+        segmentation_model=seg["segmentation_model"],
     )
+
+
+def _attach_silhouette_evidence(photo_ev, mo, mesh_glb, tags, fp, perception, log, *, has_photo):
+    """Score M_0 against the photo mask and attach the scores and margin (addendum A.3, stages 2-3).
+
+    Runs after the bas-relief check (D.1) and before orientation is chosen. No photo -> nothing to score: the
+    no-evidence fixture's mask is not a photograph. `mesh_glb` is the generated mesh; None on --dry-run, where
+    M_0 is the footprint's own OMBB and is scored as a box extruded to the OSM/fallback height.
+    score_silhouettes scores the up-axis only and is flat across azimuth_k (perception/render_compare.py), so on
+    one up-axis the margin is 0 and has_silhouette_evidence stays False: this wires the cue, it does not yet decide.
+    """
+    from perception.render_compare import margin_of, score_silhouettes
+
+    mask = photo_ev.mask
+    if not has_photo or mask is None or not np.asarray(mask).any():
+        return photo_ev
+
+    mesh = None
+    if perception != "stub":  # the stub abstains without looking at the mesh, so do not build (or import) one
+        import trimesh
+        if mesh_glb is not None:
+            mesh = trimesh.load(str(mesh_glb), force="scene") if Path(mesh_glb).is_file() else None
+        else:
+            h, _, _ = heightmod.resolve_height(osm_tags=tags, mesh_height_units=mo.mesh_height_units,
+                                               footprint_scale=1.0, footprint_area_m2=fp.area_m2)
+            mesh = trimesh.creation.box(extents=[mo.ombb.a, mo.ombb.b, h])
+        if mesh is None:
+            log(f"silhouette: skipped, no mesh at {mesh_glb}")
+            return photo_ev
+
+    cands = [cid for cid, _ in fitmod.ombb_candidates(fp, mo)]
+    scores = score_silhouettes(mesh, mask, cands, backend=perception)
+    margin = margin_of(scores)
+    photo_ev = _replace(photo_ev, silhouette_scores=scores, silhouette_margin=margin)
+    log(f"silhouette[{perception}]: " + " ".join(f"{c}={s:.3f}" for c, s in scores.items())
+        + f" margin={margin:.3f} decides={photo_ev.has_silhouette_evidence}")
+    return photo_ev
 
 
 def _generate(photos, prompt, run_dir, seed, log):
