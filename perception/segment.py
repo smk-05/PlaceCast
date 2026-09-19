@@ -4,7 +4,8 @@
     Grounding DINO ("building. house. facade.") -> box -> SAM 2 -> clean_components() -> PNG
 
 Pipeline API (contracts.SegmentBuilding; what pipeline.py imports):
-    segment_building(path) -> (mask HxW bool, mask_area_frac, occluded)
+    segment_building(path, backend=None) -> (mask HxW bool, mask_area_frac, occluded)
+    segment_building_evidence(path, backend=None) -> the same plus {"backend", "segmentation_model"} that ran
     clean(mask, close_px=5) -> mask            largest + big-enough components, close, fill holes
     assess_mask(mask)       -> (area_frac, occluded, note)     A.4 failure detection
 
@@ -48,7 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:  # `python perception/segment.py` puts perception/ first, not the repo root
     sys.path.insert(0, str(ROOT))
 
-from perception.backend import STUB, resolve_backend  # noqa: E402
+from perception.backend import REAL, STUB, resolve_backend  # noqa: E402
 
 CACHE_DIR = ROOT / ".cache" / "perception" / "masks"  # .cache/ is gitignored
 DEFAULT_OUT_DIR = ROOT / "outputs" / "masks"
@@ -385,6 +386,23 @@ def _segment_building_stub(image_path):
     return mask, float(mask.mean()), False
 
 
+def segment_building_evidence(image_path, *, backend=None):
+    """segment_building() plus a record of what ran: -> (mask, mask_area_frac, occluded, evidence).
+
+    `backend` (explicit) beats $PROCEDURA_PERCEPTION beats "real" (perception/backend.py). `evidence` is
+    {"backend": "real"|"stub", "segmentation_model": str}, describing the backend that ACTUALLY ran, so a caller
+    can log it (and PhotoEvidence.segmentation_model can be filled from it) instead of trusting its own flag.
+    """
+    ran = resolve_backend(backend)
+    if ran == STUB:
+        mask, frac, occluded = _segment_building_stub(image_path)
+        return mask, frac, occluded, {"backend": ran, "segmentation_model": f"{STUB}:central-box"}
+    mask, meta, _ = segment_file(image_path)
+    frac, occluded_by_mask, _ = assess_mask(mask)
+    occluded = bool(occluded_by_mask or meta["discarded_area_frac"] > DISCARDED_WARN_FRACTION)
+    return mask, frac, occluded, {"backend": ran, "segmentation_model": f"{REAL}:{DINO_MODEL}+{SAM_MODEL}"}
+
+
 def segment_building(image_path, *, backend=None):
     """contracts.SegmentBuilding: -> (binary HxW mask, mask_area_frac, occluded).
 
@@ -393,12 +411,9 @@ def segment_building(image_path, *, backend=None):
     building was split by an occluder) or assess_mask() flags the result. NOTE pipeline.py currently discards this
     flag (`mask, _, _ = segment_building(...)`) and recomputes occlusion from the mask alone.
     Stub: the central-box mask; needs no GPU.
+    The contract's 3-tuple is frozen; segment_building_evidence() is the same call with the backend that ran.
     """
-    if resolve_backend(backend) == STUB:
-        return _segment_building_stub(image_path)
-    mask, meta, _ = segment_file(image_path)
-    frac, occluded_by_mask, _ = assess_mask(mask)
-    return mask, frac, bool(occluded_by_mask or meta["discarded_area_frac"] > DISCARDED_WARN_FRACTION)
+    return segment_building_evidence(image_path, backend=backend)[:3]
 
 
 def main():

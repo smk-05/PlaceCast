@@ -326,6 +326,38 @@ class PipelineApiTests(unittest.TestCase):
                     again = s.segment_building(photo, backend="real")
                 np.testing.assert_array_equal(again[0], GOOD)
 
+    def test_an_explicit_backend_beats_the_environment(self):
+        """The reported bug: PROCEDURA_PERCEPTION=stub in the env must not override backend="real"."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(s, "CACHE_DIR", Path(tmp) / "cache"), mock.patch.object(s, "_device", lambda: "cpu"):
+            photo = self._photo(tmp)
+            meta = {"discarded_area_frac": 0.02, "mask_frame_fraction": float(GOOD.mean())}
+            with mock.patch.dict("os.environ", {"PROCEDURA_PERCEPTION": "stub"}):
+                with mock.patch.object(s, "segment_image", return_value=(GOOD, meta)) as seg:
+                    mask, _, _, evidence = s.segment_building_evidence(photo, backend="real")
+                    s.segment_building(photo, backend="real")  # cache hit, same path
+                np.testing.assert_array_equal(mask, GOOD)  # the real mask, not the central box
+                self.assertEqual(seg.call_count, 1)
+                self.assertEqual(evidence["backend"], "real")
+                self.assertTrue(evidence["segmentation_model"].startswith("real:"))
+            with mock.patch.dict("os.environ", {"PROCEDURA_PERCEPTION": "real"}):
+                with mock.patch.object(s, "segment_image", side_effect=AssertionError("no models on the stub path")):
+                    _, frac, _, evidence = s.segment_building_evidence(photo, backend="stub")
+                self.assertTrue(0.6 < frac < 0.7)
+                self.assertEqual(evidence, {"backend": "stub", "segmentation_model": "stub:central-box"})
+
+    def test_backend_resolution_order_is_argument_then_environment_then_real(self):
+        from perception.backend import resolve_backend
+
+        with mock.patch.dict("os.environ", {"PROCEDURA_PERCEPTION": "stub"}):
+            self.assertEqual(resolve_backend("real"), "real")
+            self.assertEqual(resolve_backend(), "stub")
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_backend(), "real")
+
+    def test_segment_building_keeps_the_frozen_three_tuple(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(len(s.segment_building(self._photo(tmp), backend="stub")), 3)
+
     def test_a_real_backend_failure_raises_and_never_falls_back_to_the_stub(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(s, "CACHE_DIR", Path(tmp) / "cache"), mock.patch.object(s, "_device", lambda: "cpu"):
             with mock.patch.object(s, "segment_image", side_effect=s.SegmentationError("no detection")):
