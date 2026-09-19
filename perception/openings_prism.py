@@ -27,14 +27,15 @@ defined on the frame DIAGONAL (43.27 mm): f_px = f35 * diag_px / 43.27.
 
 Refinement (fit_camera). The prism is projected into the image and its silhouette scored against the building mask
 by plain IoU (position and scale matter here: the camera is metric, unlike perception/render_compare's normalised
-score), over yaw +-15 deg (1 deg), east/north +-24 m (4 m), pitch 0 to +15 deg (2.5 deg) and a focal-length scale
-of 0.80-1.20 (0.05): the EXIF focal length is a nominal value, and the fit otherwise trades a wrong focal length for
-a wrong distance; pitch is absolute because phones tilt up at tall buildings and carry no EXIF pitch. The best
-coarse candidate is then refined in position only, at 1 m within one coarse step. A best value on the edge of any
-axis (yaw, east, north, focal scale, or the TOP of the pitch grid; pitch 0 is a floor, not an edge) means the
-optimum is outside the grid, so it is not trusted. camera_iou < MIN_CAMERA_IOU or an edge value sends every opening from the photo to REVIEW; a photo
-that still fails is REVIEW and the grid is not widened further (camera work is frozen). The coarse grid is ~330k
-silhouettes, scored in parallel worker processes (up to 8).
+score), over yaw +-15 deg (1 deg), east/north +-24 m (4 m) and pitch 0 to +15 deg (2.5 deg; absolute, because
+phones tilt up at tall buildings and carry no EXIF pitch). The focal length is NOT searched: it is fixed at the
+EXIF-derived value (focal scale 1.0), because focal length and camera distance trade off almost exactly and a
+searched scale drifted to the grid edge on four of six photos. The best coarse candidate is then refined in
+position only, at 1 m within one coarse step. A best value on the edge of any axis (yaw, east, north, or the TOP
+of the pitch grid; pitch 0 is a floor, not an edge) means the optimum is outside the grid, so it is not trusted.
+camera_iou < MIN_CAMERA_IOU or an edge value sends every opening from the photo to REVIEW; a photo that still
+fails is REVIEW and the grid is not widened further (camera work is frozen). The coarse grid is ~37k silhouettes,
+scored in parallel worker processes (up to 8).
 
 Size sanity. A window wider than 4 m, or any opening taller than 6 m, is REVIEW ("implausible size (grazing view)"):
 at a grazing angle the corner rays stretch a box along the wall.
@@ -87,7 +88,10 @@ POS_RANGE_M, POS_STEP_M, REFINE_STEP_M = 24.0, 4.0, 1.0
 # Absolute pitch above the horizon. Phones are tilted up at tall buildings and carry no EXIF pitch; 0 is the floor
 # (a level camera), so a best value at 0 is not an edge hit, only one at the top of the grid is.
 PITCH_GRID_DEG = (0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0)
-FOCAL_SCALES = (0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20)  # x the EXIF-derived focal length in pixels
+# x the EXIF-derived focal length in pixels. FROZEN at 1.0: focal length and camera distance trade off almost exactly,
+# so the IoU is flat along that ridge and a searched scale runs to the grid edge on noise. fit_camera still accepts a
+# `scales` sequence (the tests use it); the pipeline does not search it.
+FOCAL_SCALES = (1.0,)
 MAX_WINDOW_WIDTH_M = 4.0
 MAX_OPENING_HEIGHT_M = 6.0
 MIN_CAMERA_IOU = 0.6

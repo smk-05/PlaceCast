@@ -212,6 +212,7 @@ def test_roof_hit_and_miss_go_to_review_and_other_is_skipped():
 
 # A small search grid for the tests that are not about the grid itself: yaw +-15 (default), position +-2 m in one
 # 2 m step, pitch 0-2, no focal scaling, no fine stage, one process.
+SCALE_GRID = (0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20)  # the pipeline does NOT search scale (frozen 1.0)
 NARROW = {"pos_range": 2.0, "pos_step": 2.0, "refine_step": None, "pitches": (0.0, 1.0, 2.0), "scales": (1.0,), "workers": 1}
 
 
@@ -235,13 +236,23 @@ def test_refinement_places_the_opening_where_the_true_camera_would():
     assert r["decision"] == "ACCEPT" and r["hit_enu"] == pytest.approx([3.0, -5.0, 3.75], abs=0.15)
 
 
-def test_a_wrong_focal_length_is_recovered_as_a_scale():
+def test_focal_scale_is_frozen_at_one_by_default():
+    assert op.FOCAL_SCALES == (1.0,)
+    prism, true = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, true)
+    fit = op.fit_camera(prism, mask, true.moved(scale=1.10), yaw_range=0.0, pitches=(0.0,), pos_range=0.0,
+                        workers=1)
+    assert fit.focal_scale == 1.0 and fit.camera.f_px == pytest.approx(F_PX * 1.10)  # not searched, not corrected
+    assert fit.at_edge == ()  # a one-value axis has no edge
+
+
+def test_a_wrong_focal_length_is_recovered_as_a_scale_when_scale_is_searched():
     prism, true = _prism(), _camera(0, -40, 0.0)
     mask = _mask(prism, true)
     # An EXIF focal 10% too long: the fit should scale it back by ~0.91, i.e. the 0.90 step. Position, yaw and
     # pitch are pinned so nothing else can absorb the error.
     fit = op.fit_camera(prism, mask, true.moved(scale=1.10), yaw_range=0.0, pitches=(0.0,), pos_range=0.0,
-                        workers=1)
+                        scales=SCALE_GRID, workers=1)
     assert fit.focal_scale == pytest.approx(0.90) and fit.iou > 0.95 and fit.iou_initial < 0.9
     assert fit.camera.f_px == pytest.approx(F_PX * 1.10 * 0.90)
     assert fit.at_edge == () and fit.reliable
@@ -280,7 +291,7 @@ def test_position_is_refined_to_one_metre_inside_the_coarse_step():
 def test_the_parallel_grid_gives_the_same_fit_as_the_sequential_one():
     prism, true = _prism(), _camera(0, -40, 0.0)
     mask = _mask(prism, true)
-    kw = {"yaw_range": 10.0, "pitches": (0.0,), "pos_range": 8.0}  # 21 x 25 x 9 = 4725 candidates: parallel
+    kw = {"yaw_range": 10.0, "pitches": (0.0,), "pos_range": 8.0, "scales": SCALE_GRID}  # 4725 candidates: parallel
     start = true.moved(yaw_deg=3.0, dx=2.0, scale=1.05)
     a = op.fit_camera(prism, mask, start, workers=1, **kw)
     b = op.fit_camera(prism, mask, start, workers=2, **kw)
