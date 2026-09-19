@@ -102,11 +102,13 @@ async function show(assetId) {
 
     viewer.entities.removeAll();          // nothing uses entities any more
     viewer.scene.primitives.removeAll();
+    texturedModels = {};
 
     drawFootprint(rec, ground);
     await drawBuilding(rec, ground, () => token === showToken);
     if (token !== showToken) return;
     renderPanel(rec);
+    renderTextureToggle();
     flyTo(rec);
   } catch (e) {
     if (token !== showToken) return;
@@ -247,7 +249,11 @@ async function drawBuilding(rec, ground, stillCurrent = () => true) {
     // than the placement. The prism is exact in plan by construction — what it
     // still shows is everything the placement chain contributes: which
     // building, its outline, its height, and the ground it stands on.
-    drawFootprintPrism(rec, ground);
+    // A record with baked textures (perception/prism_texture.py) draws those walls instead of the flat polygon;
+    // the polygon stays as the fallback when there are none or they fail to load.
+    const textured = await drawTexturedPrism(rec, enuToFixed, stillCurrent);
+    if (!stillCurrent()) return;
+    if (!textured) drawFootprintPrism(rec, ground);
     drawOpenings(rec, enuToFixed);
   } else {
     errEl.textContent = `Unknown mesh_frame "${m2e.mesh_frame}" — not drawing anything.`;
@@ -272,6 +278,58 @@ function drawFootprintPrism(rec, ground) {
       outlineColour: Cesium.Color.fromCssColorString('#5c4708'),
     });
   }
+}
+
+/**
+ * Textured prism: rec.textured_glbs = { photo: 'prism_photo.glb', scorched: 'prism_scorched.glb' }, served from the
+ * run directory. The glb is in ENU metres (x east, y north, z up), so like the generated-mesh path it is loaded with
+ * upAxis Z / forwardAxis X (no axis correction) and modelMatrix = enuToFixed. Both variants are loaded and the
+ * toggle flips `show`. The opening markers stand 7 cm proud of the wall plane, so they never z-fight with it.
+ * Returns true when at least one model is on screen.
+ */
+let texturedModels = {};
+
+async function drawTexturedPrism(rec, enuToFixed, stillCurrent) {
+  texturedModels = {};
+  for (const [key, file] of Object.entries(rec.textured_glbs || {})) {
+    try {
+      const model = await Cesium.Model.fromGltfAsync({
+        url: `/assets-data/${rec.asset_id}/${file}`,
+        modelMatrix: enuToFixed,
+        upAxis: Cesium.Axis.Z,
+        forwardAxis: Cesium.Axis.X,
+      });
+      if (!stillCurrent()) {
+        model.destroy?.();
+        return false;
+      }
+      model.show = false;
+      viewer.scene.primitives.add(model);
+      texturedModels[key] = model;
+    } catch (e) {
+      console.warn(`textured prism "${key}" failed to load`, e);
+    }
+  }
+  const first = texturedModels.photo ? 'photo' : Object.keys(texturedModels)[0];
+  if (!first) return false;
+  texturedModels[first].show = true;
+  return true;
+}
+
+/** Photo <-> Scorched switch at the top of the panel (call after renderPanel, which rewrites the panel). */
+function renderTextureToggle() {
+  if (!Object.keys(texturedModels).length) return;
+  const shown = Object.keys(texturedModels).find((k) => texturedModels[k].show);
+  const button = (key, label) => `<button data-tex="${key}"${texturedModels[key] ? '' : ' disabled'}
+    style="margin-right:6px;font-weight:${key === shown ? 'bold' : 'normal'}">${label}</button>`;
+  metaEl.insertAdjacentHTML('afterbegin',
+    `<div class="flags"><b>texture</b><div>${button('photo', 'Photo')}${button('scorched', 'Scorched')}</div></div>`);
+  metaEl.querySelectorAll('button[data-tex]').forEach((b) => b.addEventListener('click', () => {
+    for (const [key, model] of Object.entries(texturedModels)) model.show = key === b.dataset.tex;
+    metaEl.querySelectorAll('button[data-tex]').forEach((x) => {
+      x.style.fontWeight = x === b ? 'bold' : 'normal';
+    });
+  }));
 }
 
 /**
