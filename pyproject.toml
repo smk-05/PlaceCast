@@ -1,0 +1,12 @@
+[project]
+name = "procedura-placement"
+version = "0.1.0"
+description = "Photo -> map-ready 3D building. VTHacks 14 / Procedura AI."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+# Modules live at the repo root (geo/, perception/, ...) and are imported as
+# top-level packages by pipeline.py. This makes pytest agree without an install.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,7 @@
+{
+  "provider": "nominatim",
+  "lat": 37.222507,
+  "lon": -80.4189121,
+  "location_type": "APPROXIMATE",
+  "normalized": "Cassell Coliseum, 675, Washington Street, Blacksburg, Montgomery County, Virginia, 24061, United States"
+}
