@@ -78,22 +78,52 @@ async function loadRuns() {
   }
 }
 
+// Switching records while one is still loading used to kill the whole scene:
+// removeAll() DESTROYS what it removes, and the in-flight load then touched a
+// destroyed object ("DeveloperError: This object was destroyed"), which stops
+// Cesium rendering for good. Every show() takes a token and abandons itself as
+// soon as a newer one starts, so only the newest load ever touches the scene.
+let showToken = 0;
+
 async function show(assetId) {
+  const token = ++showToken;
   errEl.textContent = '';
-  const rec = await (await fetch(`/api/runs/${assetId}`)).json();
-  current = rec;
+  try {
+    const rec = await (await fetch(`/api/runs/${assetId}`)).json();
+    if (token !== showToken) return;
+    current = rec;
 
-  viewer.entities.removeAll();
-  viewer.scene.primitives.removeAll();
+    // Ground FIRST: both the footprint and the building are drawn at this
+    // height, so neither needs terrain draping (see drawFootprint).
+    const [lat, lon] = rec.enu_origin_geodetic;
+    const ground = await sampleGround(Cesium.Cartographic.fromDegrees(lon, lat));
+    if (token !== showToken) return;
+    rec._ground = ground;
 
-  drawFootprint(rec);
-  await drawBuilding(rec);
-  renderPanel(rec);
-  flyTo(rec);
+    viewer.entities.removeAll();
+    viewer.scene.primitives.removeAll();
+
+    drawFootprint(rec, ground);
+    await drawBuilding(rec, ground, () => token === showToken);
+    if (token !== showToken) return;
+    renderPanel(rec);
+    flyTo(rec);
+  } catch (e) {
+    if (token !== showToken) return;
+    console.error(e);
+    errEl.textContent = `Could not show this run: ${e.message ?? e}`;
+  }
 }
 
-/** The authoritative footprint, as ground truth to eyeball the placement against. */
-function drawFootprint(rec) {
+/** The authoritative footprint, as ground truth to eyeball the placement against.
+ *
+ * Drawn at the sampled ground height, NOT draped on the terrain. A
+ * classificationType TERRAIN polygon is a ground primitive that Cesium builds
+ * asynchronously; switching records removed it mid-build and the renderer died
+ * with "DeveloperError: This object was destroyed" — the whole scene stops, and
+ * no guard in this file can prevent that, because the destroy happens inside
+ * Cesium's own pending build. A polygon at a fixed height is built inline. */
+function drawFootprint(rec, ground) {
   const geom = rec.footprint_geojson;
   if (!geom || !geom.coordinates) return;
 
@@ -114,7 +144,8 @@ function drawFootprint(rec) {
       material: Cesium.Color.fromCssColorString('#1b6ca8').withAlpha(0.35),
       outline: true,
       outlineColor: Cesium.Color.fromCssColorString('#1b6ca8'),
-      classificationType: Cesium.ClassificationType.TERRAIN,
+      perPositionHeight: false,
+      height: ground + 0.2,   // just clear of the terrain, no z-fighting
     },
   });
 }
@@ -129,7 +160,7 @@ function drawFootprint(rec) {
  *
  *   modelMatrix = ENU->ECEF (footprint centroid, at ground) x mesh_to_enu
  */
-async function drawBuilding(rec) {
+async function drawBuilding(rec, ground, stillCurrent = () => true) {
   const m2e = rec.mesh_to_enu;
   if (!m2e) {
     errEl.textContent = 'This record predates mesh_to_enu — re-run pipeline.py for it '
@@ -138,9 +169,7 @@ async function drawBuilding(rec) {
   }
 
   const [lat, lon] = rec.enu_origin_geodetic;
-  // Spec 8: sample at maximum detail and PIN it; never re-sample on camera moves.
-  const ground = await sampleGround(Cesium.Cartographic.fromDegrees(lon, lat));
-  rec._ground = ground;   // flyTo aims the camera at this height
+  // Ground was sampled once in show() (spec 8: maximum detail, then PINNED).
   console.info(`ground at footprint centroid: ${ground.toFixed(1)} m (ellipsoidal)`);
   const enuToFixed = Cesium.Transforms.eastNorthUpToFixedFrame(
     Cesium.Cartesian3.fromDegrees(lon, lat, ground),
@@ -166,12 +195,17 @@ async function drawBuilding(rec) {
     // getAxisCorrectionMatrix). mesh_to_enu already contains the full rotation,
     // so both must be off: upAxis Z skips the first, forwardAxis X the second.
     // Leaving the default forwardAxis would twist every building 90 degrees.
+    if (!stillCurrent()) return;
     const model = await Cesium.Model.fromGltfAsync({
       url: glbUrl,
       modelMatrix,
       upAxis: Cesium.Axis.Z,
       forwardAxis: Cesium.Axis.X,
     });
+    if (!stillCurrent()) {
+      model.destroy?.();
+      return;
+    }
     viewer.scene.primitives.add(model);
   } else if (m2e.mesh_frame === 'unit_box_centred') {
     // No generated mesh. Draw the AUTHORITATIVE footprint extruded to the
@@ -257,8 +291,21 @@ function renderPanel(rec) {
     ['solver', fit.solver || '-'],
   ];
 
+  // A prism record's fit metrics come from the solver's OMBB BOX proxy, not
+  // from the footprint prism on screen: the prism is the footprint, so its plan
+  // is exact by construction and an IoU of 0.65 would be read as a placement
+  // error when it is the rectangle approximation being measured.
+  const isPrism = rec.mesh_to_enu?.mesh_frame === 'unit_box_centred';
+  const note = isPrism
+    ? '<div class="flags"><b>drawn: footprint prism</b><br>No generated mesh for '
+      + 'this run. The authoritative footprint is extruded to the resolved '
+      + 'height, so its plan matches exactly. The numbers below are the '
+      + "solver's rectangular-box proxy, not this prism.</div>"
+    : '';
+
   metaEl.innerHTML = `
     <div style="margin:8px 0"><span class="badge ${d}">${d.replace('_', ' ')}</span></div>
+    ${note}
     <table>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>
     ${(rec.review_reasons || []).length
       ? `<div class="flags"><b>flags</b><ul>${rec.review_reasons
