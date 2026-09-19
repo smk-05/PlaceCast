@@ -24,10 +24,12 @@ strong signal that something is wrong."
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import numpy as np
 
 from contracts import CandidateId, Disambiguator, Footprint, MeshOutline, PhotoEvidence
+from geo.coords import theta_to_heading
 
 # Addendum A.3: silhouette decides only above this margin; below it we fall
 # through to the road-normal prior and flag for review regardless of IoU.
@@ -175,6 +177,14 @@ def facade_detail_scores(vertices_canonical: np.ndarray,
 # --------------------------------------------------------------------------
 
 
+class OrientationChoice(NamedTuple):
+    chosen: CandidateId
+    disambiguated_by: Disambiguator
+    reasons: list[str]
+    # None when EXIF or silhouette evidence was absent. See FitResult.
+    exif_silhouette_disagree: bool | None
+
+
 def choose_orientation(fp: Footprint,
                        mo: MeshOutline,
                        scored: list[tuple[CandidateId, float]],
@@ -184,25 +194,63 @@ def choose_orientation(fp: Footprint,
                        building_lon: float | None = None,
                        roads_enu: list[np.ndarray] | None = None,
                        vertices_canonical: np.ndarray | None = None,
-                       ) -> tuple[CandidateId, Disambiguator, list[str]]:
-    """-> (chosen candidate, which filter decided, review reasons).
+                       ) -> OrientationChoice:
+    """Resolve the four-fold ambiguity.
 
     Precedence is addendum A.3's, extended with the mesh-only filters:
 
       1. EXIF heading, present and plausible            -> it decides
+      -  genuinely symmetric footprint, nothing else    -> arbitrary, flagged
       2. silhouette score, if margin >= 0.08            -> it decides
       3. facade detail agreeing with the road normal    -> it decides
       4. road normal alone                              -> decides, ALWAYS flagged
       5. best footprint IoU                             -> decides, flagged if margin low
 
-    Do not let a later filter silently override a confident earlier one.
+    EXIF is checked BEFORE the symmetry bail-out: a square footprint is
+    ambiguous to IoU, but a camera bearing is not, so EXIF can still resolve it.
+
+    Both EXIF and silhouette are evaluated even when EXIF decides, so that their
+    disagreement can be recorded — addendum A.3 treats conflict between
+    independent orientation evidence as a confidence signal in its own right.
     """
     reasons: list[str] = []
     viable = viable_by_aspect(fp, [c for c, _ in scored])
     by_score = [c for c, _ in scored if c in viable] or [c for c, _ in scored]
     margin = scored[0][1] - scored[1][1] if len(scored) > 1 else 0.0
 
-    # Genuinely symmetric: no filter can resolve what has no answer.
+    # --- evaluate the two evidence cues independently ----------------------
+    exif_choice: CandidateId | None = None
+    if photo is not None and building_lat is not None and building_lon is not None:
+        cam_az = azimuth_from_exif(photo, building_lat, building_lon)
+        if cam_az is not None:
+            # The photographed facade faces back toward the camera.
+            exif_choice = _closest_candidate_to_facing(fp, mo, viable, cam_az + math.pi)
+            if exif_choice is None:
+                reasons.append("EXIF bearing present but the mesh front is "
+                               "unknown — cannot map it to a facade")
+
+    sil_choice: CandidateId | None = None
+    if photo is not None and photo.has_silhouette_evidence:
+        ranked = sorted(photo.silhouette_scores.items(), key=lambda kv: kv[1],
+                        reverse=True)
+        sil_choice = next((cid for cid, _ in ranked if cid in viable), None)
+
+    disagree = (exif_choice != sil_choice
+                if exif_choice is not None and sil_choice is not None else None)
+    if disagree:
+        reasons.append(
+            f"EXIF selects k={exif_choice.azimuth_k} but silhouette selects "
+            f"k={sil_choice.azimuth_k} — independent evidence conflicts (addendum A.3)"
+        )
+
+    def done(c, by):
+        return OrientationChoice(c, by, reasons, disagree)
+
+    # --- 1. EXIF -----------------------------------------------------------
+    if exif_choice is not None:
+        return done(exif_choice, Disambiguator.EXIF_HEADING)
+
+    # Genuinely symmetric: no remaining filter can resolve what has no answer.
     aspect = fp.ombb.aspect if fp.ombb else 1.0
     if aspect < SYMMETRIC_ASPECT and margin < 0.05:
         sil_margin = photo.silhouette_margin if photo else 0.0
@@ -211,33 +259,21 @@ def choose_orientation(fp: Footprint,
                 f"symmetric footprint (aspect {aspect:.2f}) with no discriminating "
                 "evidence — orientation is arbitrary, not wrong"
             )
-            return by_score[0], Disambiguator.ARBITRARY_SYMMETRIC, reasons
+            return done(by_score[0], Disambiguator.ARBITRARY_SYMMETRIC)
 
-    # --- 1. EXIF -----------------------------------------------------------
-    if photo is not None and building_lat is not None and building_lon is not None:
-        cam_az = azimuth_from_exif(photo, building_lat, building_lon)
-        if cam_az is not None:
-            chosen = _closest_candidate_to_facing(mo, viable, cam_az + math.pi)
-            if chosen is not None:
-                return chosen, Disambiguator.EXIF_HEADING, reasons
-
-    # --- 2. silhouette (perception; absent until the friend's code lands) ---
-    if photo is not None and photo.has_silhouette_evidence:
-        ranked = sorted(photo.silhouette_scores.items(), key=lambda kv: kv[1],
-                        reverse=True)
-        for cid, _ in ranked:
-            if cid in viable:
-                if margin > 0.05 and cid != by_score[0]:
-                    reasons.append(
-                        "silhouette and footprint-IoU margins disagree — "
-                        "independent evidence conflicts (addendum A.3)"
-                    )
-                return cid, Disambiguator.SILHOUETTE, reasons
+    # --- 2. silhouette (perception) -----------------------------------------
+    if sil_choice is not None:
+        if margin > 0.05 and sil_choice != by_score[0]:
+            reasons.append(
+                "silhouette and footprint-IoU margins disagree — "
+                "independent evidence conflicts (addendum A.3)"
+            )
+        return done(sil_choice, Disambiguator.SILHOUETTE)
 
     # --- 3 / 4. road normal, optionally corroborated by facade detail ------
     normal = road_normal(fp, roads_enu or [])
     if normal is not None:
-        chosen = _closest_candidate_to_facing(mo, viable, normal)
+        chosen = _closest_candidate_to_facing(fp, mo, viable, normal)
         if chosen is not None:
             if vertices_canonical is not None:
                 detail = facade_detail_scores(vertices_canonical)
@@ -248,36 +284,86 @@ def choose_orientation(fp: Footprint,
                         f"facade detail concentrated on side {detailed_side} "
                         f"(spread {spread:.3f})"
                     )
-                    return chosen, Disambiguator.FACADE_DETAIL, reasons
+                    return done(chosen, Disambiguator.FACADE_DETAIL)
             reasons.append(
                 "orientation from the street-facing prior alone — this is a "
                 "prior, not evidence; flagged regardless of IoU (spec 6.6)"
             )
-            return chosen, Disambiguator.ROAD_NORMAL, reasons
+            return done(chosen, Disambiguator.ROAD_NORMAL)
 
     # --- 5. fall back to IoU ----------------------------------------------
     if margin < 0.05:
         reasons.append(
             f"rotation margin {margin:.3f} < 0.05 with no disambiguating cue"
         )
-    return by_score[0], Disambiguator.ASPECT_RATIO, reasons
+    return done(by_score[0], Disambiguator.ASPECT_RATIO)
 
 
-def _closest_candidate_to_facing(mo: MeshOutline, viable: list[CandidateId],
-                                 target_az: float) -> CandidateId | None:
-    """Pick the candidate whose front face points nearest `target_az`.
+# --------------------------------------------------------------------------
+# facade_heading — the one place a candidate becomes a compass bearing
+# --------------------------------------------------------------------------
 
-    The mesh's front is +X in the canonical frame (spec 6.1: glTF's asset front
-    faces +Z, rotated to +X when we canonicalise the up-axis to +Z), so
-    candidate k faces base_angle + k*pi/2.
-    """
-    if not viable or mo.ombb is None:
+
+def _candidate_theta(fp: Footprint, mo: MeshOutline, candidate: CandidateId) -> float:
+    """World rotation (mathematical theta) the OMBB init assigns to a candidate."""
+    from geo.fit import ombb_candidates
+
+    for cid, params in ombb_candidates(fp, mo):
+        if cid.azimuth_k == candidate.azimuth_k:
+            return float(params["theta"])
+    raise ValueError(f"no OMBB candidate with azimuth_k={candidate.azimuth_k}")
+
+
+def _facing_theta(fp: Footprint, mo: MeshOutline, candidate: CandidateId,
+                  theta: float | None = None) -> float | None:
+    """Direction the front facade faces in the world, mathematical radians."""
+    if mo.front_angle is None:
         return None
-    base = mo.ombb.angle
+    t = _candidate_theta(fp, mo, candidate) if theta is None else theta
+    # apply_similarity rotates mesh directions by theta, so a canonical-frame
+    # direction phi ends up at phi + theta in ENU.
+    return t + mo.front_angle
+
+
+def facade_heading(fp: Footprint, mo: MeshOutline, candidate: CandidateId,
+                   *, theta: float | None = None) -> float:
+    """Compass bearing in degrees [0, 360) the front facade faces under
+    `candidate`. 0 = North, 90 = East. See contracts.FacadeHeading.
+
+    Uses the closed-form OMBB rotation for the candidate. Pass `theta` (e.g.
+    FitResult.theta) to use the refined rotation instead; refinement moves it by
+    a few degrees, which never changes which 90-degree candidate is meant.
+
+    Raises ValueError when the mesh front is unknown. Do not substitute a
+    default — an unknown front means this cue has nothing to say.
+    """
+    if candidate.up_axis_idx != mo.up_axis_idx:
+        raise ValueError(
+            f"candidate up_axis_idx={candidate.up_axis_idx} does not match the "
+            f"outline's up_axis_idx={mo.up_axis_idx}"
+        )
+    facing = _facing_theta(fp, mo, candidate, theta)
+    if facing is None:
+        raise ValueError(
+            "mesh front facade is unknown (MeshOutline.front_angle is None) — "
+            "no bearing can be assigned"
+        )
+    return math.degrees(theta_to_heading(facing))
+
+
+def _closest_candidate_to_facing(fp: Footprint, mo: MeshOutline,
+                                 viable: list[CandidateId],
+                                 target: float) -> CandidateId | None:
+    """Candidate whose front facade faces nearest `target` (math radians).
+
+    None when the front is unknown — the filter abstains rather than guessing.
+    """
+    if not viable or mo.front_angle is None or mo.ombb is None or fp.ombb is None:
+        return None
     best, best_d = None, float("inf")
     for c in viable:
-        facing = base + c.azimuth_k * math.pi / 2.0
-        d = abs(math.atan2(math.sin(facing - target_az), math.cos(facing - target_az)))
+        facing = _facing_theta(fp, mo, c)
+        d = abs(math.atan2(math.sin(facing - target), math.cos(facing - target)))
         if d < best_d:
             best, best_d = c, d
     return best

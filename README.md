@@ -116,14 +116,41 @@ itself a confidence feature.
 
 ### Handoff to the perception contributor
 
-Send `contracts.py`, `requirements-ml.txt`, and `fixtures/fake_fits.py`. Satisfy
-three signatures and integration is an import change:
+`contracts.py` is **frozen at v1.0** (git tag `contracts-v1`). Changing a field
+name, type or meaning needs both contributors, a `CONTRACT_VERSION` bump and a
+new tag.
+
+Perception provides three functions; geometry provides one back:
 
 ```python
+# perception -> geometry
 perception/segment.py        segment_building(path)  -> (mask, area_frac, occluded)
 perception/render_compare.py score_silhouettes(mesh, mask, candidates) -> {cid: iou}
 confidence/gate.py           score_confidence(fit, photo, fp) -> (p, Decision)
+
+# geometry -> perception
+geo/disambiguate.py          facade_heading(fp, mo, candidate) -> compass bearing, degrees
 ```
+
+Where the confidence features live — everything `score_confidence` needs is on
+the three objects it receives:
+
+| addendum B.3 feature | read it from |
+|---|---|
+| `footprint_iou`, `hausdorff_m`, `anisotropy_log_ratio`, `max_neighbor_overlap` | `fit.*` |
+| `area_ratio_log` | `log(fit.area_ratio)` |
+| `rotation_margin_footprint` | `fit.rotation_margin_footprint` |
+| `rotation_margin_silhouette` | `photo.silhouette_margin` |
+| `exif_silhouette_disagree` | `fit.exif_silhouette_disagree` — `None` when a cue was absent |
+| `height_source_authoritative` | `fit.height_source_authoritative` |
+| `rectilinearity` | `fp.rectilinearity` |
+| `geocode_rooftop` | `fp.geocode_rooftop` |
+| footprint match quality | `fp.match_quality`, `fp.is_weak_match` |
+
+`exif_silhouette_disagree` lives on `FitResult`, not `PhotoEvidence`, because
+it can only be computed during disambiguation: mapping an EXIF bearing to a
+candidate needs `facade_heading`, which depends on the fitted mesh outline, and
+`PhotoEvidence` is frozen before geometry runs.
 
 Two warnings worth passing on:
 
@@ -164,9 +191,23 @@ breakdown matters more than the headline — only a third of buildings give metr
 directly, and `building:levels × 3 m` is load-bearing for the rest, so the
 fallback chain is the common path rather than the exception.
 
-Still unchecked: **Microsoft GlobalMLBuildingFootprints**, which carries height
-for 174M+ buildings. If it covers the untagged tail, the depth branch may become
-unnecessary. `geo/height.py:from_microsoft` is written and unwired.
+**Microsoft GlobalMLBuildingFootprints** (`scripts/check_microsoft_heights.py`)
+covers 6 of the 7 OSM-untagged buildings (not Hutcheson) — but its heights are
+not trustworthy here. Against the five buildings with an explicit OSM `height`
+in metres, it underestimated every one:
+
+| building | OSM `height` | Microsoft | error |
+|---|---|---|---|
+| Burruss | 20.7 | 11.3 | −45% |
+| McBryde | 23.9 | 11.6 | −51% |
+| Whittemore | 37.4 | 12.2 | −67% |
+| Patton | 16.4 | 9.2 | −44% |
+| War Memorial | 18.8 | 9.0 | −52% |
+
+All 20 Microsoft values fall in a 7–16 m band. So Microsoft is **not**
+authoritative in this codebase (deviating from spec §7.1) and ranks below
+monocular depth in the height chain. Section C is still needed. Those five
+buildings are also the natural ground truth for validating it.
 
 ---
 

@@ -545,7 +545,8 @@ def compute_ombb(pts: np.ndarray) -> OMBB:
 def build_footprint(polygon_lonlat: Polygon | MultiPolygon, frame: ENUFrame, *,
                     simplify_eps: float = 0.4,
                     source: str = "osm",
-                    match_quality: str = "") -> Footprint:
+                    match_quality: str = "",
+                    geocode_location_type: str = "") -> Footprint:
     """Project an OSM geometry into the ENU frame and condition it. Spec 3-4.
 
     Multi-part footprints (Lane Stadium's four stands) keep every part. The
@@ -587,6 +588,7 @@ def build_footprint(polygon_lonlat: Polygon | MultiPolygon, frame: ENUFrame, *,
         area_m2=float(full.area),
         source=source,
         match_quality=match_quality,
+        geocode_location_type=geocode_location_type,
     )
 
 

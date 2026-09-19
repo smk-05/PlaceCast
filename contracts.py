@@ -30,6 +30,11 @@ Deviations from addendum F.1, all deliberate:
 
 from __future__ import annotations
 
+# FROZEN. Changing any field name, type or meaning below needs both
+# contributors to agree, a bump here, and a new git tag (contracts-vN).
+# Adding a defaulted field is backwards-compatible; still bump the minor.
+CONTRACT_VERSION = "1.0"
+
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
@@ -70,11 +75,17 @@ class HeightSource(str, Enum):
 
     @property
     def is_authoritative(self) -> bool:
-        return self in (
-            HeightSource.OSM_HEIGHT,
-            HeightSource.OSM_LEVELS,
-            HeightSource.MICROSOFT,
-        )
+        """OSM tags only. Microsoft is deliberately NOT authoritative.
+
+        Spec 7.1 treats Microsoft's `height` as authoritative. Measured on the
+        five VT buildings that carry an explicit OSM `height` in metres
+        (scripts/check_microsoft_heights.py, 2026-09-19), Microsoft
+        underestimated every one by 44-67% (median 51%) and compressed all 20
+        campus buildings it covered into a 7-16 m band. Calling that
+        authoritative would make the confidence model trust a value that is
+        wrong by half.
+        """
+        return self in (HeightSource.OSM_HEIGHT, HeightSource.OSM_LEVELS)
 
 
 class Disambiguator(str, Enum):
@@ -171,6 +182,11 @@ class Footprint:
     # "contained_and_named" | "contained" | "name_match" | "unnamed_sole_candidate"
     # A feature for the confidence model, alongside geocode_rooftop.
     match_quality: str = ""
+    # The geocoder's own precision claim (spec 3.1): ROOFTOP, RANGE_INTERPOLATED,
+    # GEOMETRIC_CENTER or APPROXIMATE. Lives here because it is evidence about
+    # whether THIS polygon is the right building, and score_confidence receives
+    # the Footprint but never the raw geocode.
+    geocode_location_type: str = ""
 
     @property
     def has_holes(self) -> bool:
@@ -184,6 +200,11 @@ class Footprint:
     def is_weak_match(self) -> bool:
         """True when the footprint was accepted on thin evidence (spec 3.2)."""
         return self.match_quality in ("unnamed_sole_candidate", "")
+
+    @property
+    def geocode_rooftop(self) -> bool:
+        """Addendum B.3 feature `geocode_rooftop`."""
+        return self.geocode_location_type == "ROOFTOP"
 
     @property
     def is_ill_posed(self) -> bool:
@@ -212,6 +233,11 @@ class MeshOutline:
     extent_ratio: float = 1.0                    # min/max horizontal extent
     up_axis_idx: int = 4                         # spec 6.1, default +Z
     mesh_height_units: float = 1.0               # model-unit height, for scale_z
+    # Direction the mesh's FRONT facade faces in the canonical frame, radians CCW
+    # from canonical +X. For a glTF-conforming (+Y up, front +Z) mesh this is
+    # -pi/2. None when unknowable — a box has no front, and a Z-up mesh broke the
+    # glTF convention — in which case every facade-to-bearing filter abstains.
+    front_angle: float | None = None
 
     @property
     def has_holes(self) -> bool:
@@ -252,6 +278,22 @@ class FitResult:
     disambiguated_by: Disambiguator = Disambiguator.ASPECT_RATIO
     solver: str = "stub"                     # e.g. "ombb+icp+nelder-mead"
     candidate_ious: tuple[tuple[CandidateId, float], ...] = ()  # spec 9.3 payload
+
+    # Did EXIF heading and the silhouette score pick DIFFERENT candidates?
+    # None when either cue was absent, so "no disagreement" and "nothing to
+    # compare" stay distinguishable. Addendum A.3: disagreement between
+    # independent orientation evidence is itself a strong signal.
+    #
+    # Lives on FitResult, not PhotoEvidence, on purpose: PhotoEvidence is
+    # perception's output and is frozen BEFORE geometry runs, but deciding which
+    # candidate an EXIF bearing selects needs facade_heading(), which depends on
+    # the fitted mesh outline. It can only be computed during disambiguation.
+    exif_silhouette_disagree: bool | None = None
+
+    @property
+    def height_source_authoritative(self) -> bool:
+        """Addendum B.3 feature `height_source_authoritative`."""
+        return self.height_source.is_authoritative
 
     @property
     def is_mirrored(self) -> bool:
@@ -298,7 +340,9 @@ class PhotoEvidence:
     exif_focal_mm: float | None = None
     exif_gps: tuple[float, float] | None = None  # (lat, lon) of the camera
 
-    # Silhouette render-and-compare (addendum A.3) — requires segmentation
+    # Silhouette render-and-compare (addendum A.3) — requires segmentation.
+    # silhouette_margin = top-two gap of silhouette_scores. The EXIF-vs-
+    # silhouette disagreement flag is on FitResult; see the note there.
     silhouette_scores: dict[CandidateId, float] = field(default_factory=dict)
     silhouette_margin: float = 0.0
     segmentation_model: str = "stub"
@@ -387,6 +431,7 @@ class PlacementRecord:
                 "anisotropy_log_ratio": f.anisotropy_log_ratio,
                 "max_neighbor_overlap": f.max_neighbor_overlap,
                 "disambiguated_by": f.disambiguated_by.value,
+                "exif_silhouette_disagree": f.exif_silhouette_disagree,
                 "solver": f.solver,
                 "candidate_ious": {str(c): v for c, v in f.candidate_ious},
             }
@@ -428,6 +473,21 @@ class ScoreSilhouettes(Protocol):
         scaling to a common box, not raw masks. A street photo is perspective
         and the render is orthographic, and that mismatch corrupts exactly the
         absolute position and scale that normalisation discards.
+        """
+        ...
+
+
+class FacadeHeading(Protocol):
+    def __call__(self, fp: Footprint, mo: MeshOutline,
+                 candidate: CandidateId) -> float:
+        """Provided BY geometry, FOR perception: geo.disambiguate.facade_heading.
+
+        -> compass bearing in degrees [0, 360) that the mesh's front facade
+        faces when placed with `candidate`. 0 = North, 90 = East (spec 2.4).
+
+        Raises ValueError when the mesh's front is unknown (MeshOutline.
+        front_angle is None). Callers must treat that as "no bearing", never
+        substitute a default.
         """
         ...
 

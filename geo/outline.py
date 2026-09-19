@@ -116,24 +116,53 @@ def robust_base(heights: np.ndarray, percentile: float = 1.0) -> float:
     return float(np.percentile(heights, percentile))
 
 
+def canonical_rotation(up_axis_idx: int) -> np.ndarray:
+    """The 3x3 rotation taking candidate up-axis `up_axis_idx` to +Z."""
+    axis = UP_AXIS_CANDIDATES[up_axis_idx]
+    z = np.array([0.0, 0.0, 1.0])
+
+    if np.allclose(axis, z):
+        return np.eye(3)
+    if np.allclose(axis, -z):
+        return np.diag([1.0, -1.0, -1.0])
+    v = np.cross(axis, z)
+    c = float(np.dot(axis, z))
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+
+# glTF 2.0: the asset front faces +Z (spec 6.1, 13.1).
+GLTF_FRONT = np.array([0.0, 0.0, 1.0])
+
+
+def front_angle_canonical(up_axis_idx: int) -> float | None:
+    """Direction the glTF front (+Z) points after canonicalisation, radians CCW
+    from canonical +X. None when it cannot be known.
+
+    For the normal case — a glTF-conforming mesh, +Y up (idx 2) — the front
+    lands on canonical -Y, i.e. -pi/2. NOT +X.
+
+    If the mesh turned out to be Z-up (idx 4/5), the generator did not follow the
+    glTF convention, so +Z is the roof rather than the front and the front is
+    genuinely unknown. Returning None there is deliberate: every filter that
+    matches a facade to a bearing (EXIF, road normal) must then abstain rather
+    than guess.
+
+    ASSUMPTION TO VERIFY on the first real TRELLIS mesh: that the photographed
+    facade is the glTF front. Render it once and check.
+    """
+    f = canonical_rotation(up_axis_idx) @ GLTF_FRONT
+    if float(np.hypot(f[0], f[1])) < 0.5:
+        return None
+    return float(np.arctan2(f[1], f[0]))
+
+
 def canonicalise(vertices: np.ndarray, up_axis_idx: int) -> tuple[np.ndarray, float]:
     """Rotate so the chosen axis is +Z, drop the base to z=0, centre in XY.
 
     -> (vertices in canonical frame, height in model units)
     """
-    axis = UP_AXIS_CANDIDATES[up_axis_idx]
-    z = np.array([0.0, 0.0, 1.0])
-
-    if np.allclose(axis, z):
-        rot = np.eye(3)
-    elif np.allclose(axis, -z):
-        rot = np.diag([1.0, -1.0, -1.0])
-    else:
-        v = np.cross(axis, z)
-        c = float(np.dot(axis, z))
-        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-        rot = np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
-
+    rot = canonical_rotation(up_axis_idx)
     out = vertices @ rot.T
     base = robust_base(out[:, 2])
     top = float(np.percentile(out[:, 2], 99.0))
@@ -267,6 +296,7 @@ def build_mesh_outline(vertices: np.ndarray,
         extent_ratio=ratio,
         up_axis_idx=up_axis_idx,
         mesh_height_units=height_units,
+        front_angle=front_angle_canonical(up_axis_idx),
     )
 
 
@@ -283,6 +313,9 @@ def outline_from_footprint(fp) -> MeshOutline:
     between candidates k and k+2 is structurally zero. That is not a bug: it is
     precisely why spec 6.6 needs filters beyond IoU, and the run will correctly
     report a zero margin and route to review.
+
+    A box has no front, so `front_angle` stays None and the EXIF and road-normal
+    filters abstain on this path.
     """
     box = fp.ombb
     corners = np.array([

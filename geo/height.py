@@ -106,29 +106,44 @@ def resolve_height(*,
     an authoritative OSM tag — addendum C.3: "OSM wins." When both exist and
     disagree by more than 30%, the disagreement is logged, because a table of
     those is a good honest-results slide.
+
+    Order: OSM tags -> monocular depth (if sane) -> Microsoft -> proportional.
+    Microsoft sits BELOW depth, deviating from spec 7.1, because on this campus
+    it was measured underestimating every building with an explicit OSM height
+    by 44-67% (see HeightSource.is_authoritative). A known-biased value should
+    not outrank an unbiased-but-noisy one.
     """
     notes: list[str] = []
 
     result = from_osm_tags(osm_tags or {})
-    if result is None:
-        result = from_microsoft(microsoft_height)
-
     if result is not None:
         h, src = result
-        if depth_estimate is not None and h > 0:
-            rel = abs(depth_estimate - h) / h
-            if rel > 0.30:
-                notes.append(
-                    f"monocular depth {depth_estimate:.1f} m disagrees with "
-                    f"{src.value} {h:.1f} m by {rel:.0%} — authoritative tag wins"
-                )
+        for label, other in (("monocular depth", depth_estimate),
+                             ("Microsoft", microsoft_height)):
+            if other is not None and other > 0 and h > 0:
+                rel = abs(other - h) / h
+                if rel > 0.30:
+                    notes.append(
+                        f"{label} {other:.1f} m disagrees with {src.value} "
+                        f"{h:.1f} m by {rel:.0%} — authoritative tag wins"
+                    )
         return h, src, notes
+
+    ms = from_microsoft(microsoft_height)
 
     if depth_estimate is not None:
         ok, why = sanity_check(depth_estimate, footprint_area_m2)
         if ok:
+            if ms is not None:
+                notes.append(f"Microsoft height {ms[0]:.1f} m available but "
+                             "ranked below depth (known ~50% low on this campus)")
             return float(depth_estimate), HeightSource.MONOCULAR_DEPTH, notes
         notes.append(f"monocular depth rejected: {why}")
+
+    if ms is not None:
+        notes.append("Microsoft height used — NOT authoritative; measured ~50% "
+                     "low against OSM on this campus, expect an underestimate")
+        return ms[0], ms[1], notes
 
     h, src = proportional_fallback(mesh_height_units, footprint_scale,
                                    footprint_area_m2)

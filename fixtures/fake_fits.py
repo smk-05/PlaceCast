@@ -40,7 +40,8 @@ def _ombb(a: float, b: float, angle: float = 0.0) -> OMBB:
 
 def make_footprint(rectilinearity: float, aspect: float = 1.6,
                    area: float = 800.0,
-                   match_quality: str = "contained_and_named") -> Footprint:
+                   match_quality: str = "contained_and_named",
+                   geocode_location_type: str = "ROOFTOP") -> Footprint:
     """A synthetic footprint.
 
     `match_quality` defaults to the strong case. It is NOT cosmetic: an empty
@@ -59,6 +60,7 @@ def make_footprint(rectilinearity: float, aspect: float = 1.6,
         ombb=_ombb(max(a, b), min(a, b)),
         area_m2=area,
         match_quality=match_quality,
+        geocode_location_type=geocode_location_type,
     )
 
 

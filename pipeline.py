@@ -75,7 +75,8 @@ def run(address: str,
     # ENU anchored at the footprint centroid (spec 2.2)
     frame = ENUFrame(lat0=poly_lonlat.centroid.y, lon0=poly_lonlat.centroid.x)
     fp = build_footprint(poly_lonlat, frame,
-                         match_quality=element.get("_match_quality", ""))
+                         match_quality=element.get("_match_quality", ""),
+                         geocode_location_type=g["location_type"])
     log(f"conditioned: {len(fp.pts_enu)} verts, {fp.area_m2:.0f} m2, "
         f"R={fp.rectilinearity:.3f}, aspect={fp.ombb.aspect:.2f}, "
         f"parts={1 + len(fp.parts_enu)}, match={fp.match_quality}")
@@ -113,7 +114,7 @@ def run(address: str,
     # -- 6.6 disambiguate, then 6.5-6.9 solve -------------------------------
     cands = fitmod.ombb_candidates(fp, mo)
     scored = fitmod.score_candidates(fp, mo, cands)
-    chosen, by, reasons = disambiguate.choose_orientation(
+    chosen, by, reasons, exif_sil_disagree = disambiguate.choose_orientation(
         fp, mo, scored,
         photo=photo_ev,
         building_lat=poly_lonlat.centroid.y,
@@ -127,6 +128,7 @@ def run(address: str,
 
     result = fitmod.solve(fp, mo, chosen=chosen, disambiguated_by=by,
                           allow_anisotropy=allow_anisotropy)
+    result = _replace(result, exif_silhouette_disagree=exif_sil_disagree)
     log(f"fit: IoU={result.iou:.3f} hausdorff={result.hausdorff_m:.2f}m "
         f"area_ratio={result.area_ratio:.3f} margin={result.rotation_margin_footprint:.3f}")
 
