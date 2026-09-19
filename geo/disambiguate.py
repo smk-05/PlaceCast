@@ -166,36 +166,43 @@ def facade_detail_scores(vertices_canonical: np.ndarray,
     tessellation artifacts, variance alone rewards noise.
     """
     xy = vertices_canonical[:, :2]
-    centre = xy.mean(axis=0)
-    rel = xy - centre
-    ang = np.arctan2(rel[:, 1], rel[:, 0])
-    rad = np.linalg.norm(rel, axis=1)
+    # Normalise by the (robust) bounding box so the walls sit at +-1 on each
+    # axis. An earlier version used 90-degree angular wedges and a radial
+    # "shell" cut, which on an elongated plan (NCB: aspect 2.2) threw away most
+    # of the long walls — where the front usually is — because they are closer
+    # to the centre than the short end walls.
+    lo, hi = np.percentile(xy, [2, 98], axis=0)
+    centre = (lo + hi) / 2.0
+    half = np.maximum((hi - lo) / 2.0, 1e-9)
+    nrm = (xy - centre) / half
+    ax = np.abs(nrm)
 
-    # Only the outer shell carries facade detail; the interior is fill.
-    shell = rad >= np.percentile(rad, 55.0)
+    near_wall = ax.max(axis=1) >= 0.8
+    on_x = ax[:, 0] >= ax[:, 1]
+    side = np.where(on_x, np.where(nrm[:, 0] > 0, 0, 2), np.where(nrm[:, 1] > 0, 1, 3))
+    # Depth behind the wall plane, in model units: recessed windows and trim
+    # spread it; a smooth hallucinated back wall does not.
+    depth = np.where(on_x, (1.0 - ax[:, 0]) * half[0], (1.0 - ax[:, 1]) * half[1])
+    wall_len = np.array([2 * half[1], 2 * half[0], 2 * half[1], 2 * half[0]])
+    perimeter = float(wall_len.sum())
 
     scores = np.zeros(4)
     for k in range(4):
-        lo = -math.pi / 4 + k * math.pi / 2
-        hi = lo + math.pi / 2
-        a = np.mod(ang - lo, 2 * math.pi)
-        sel = shell & (a < (hi - lo))
+        sel = near_wall & (side == k)
         n = int(sel.sum())
         if n < 8:
             continue
 
-        density = n / max(len(xy), 1)
+        # Vertices per unit wall LENGTH, relative to the building's average —
+        # otherwise the longer wall always wins on raw count.
+        density = (n / max(len(xy), 1)) / (wall_len[k] / perimeter)
         z = vertices_canonical[sel, 2]
         z_spread = float(z.std() / max(z.mean(), 1e-6)) if z.size else 0.0
 
         if face_normals is not None and len(face_normals) == len(vertices_canonical):
-            nv = face_normals[sel]
-            variance = float(np.mean(np.var(nv, axis=0)))
+            variance = float(np.mean(np.var(face_normals[sel], axis=0)))
         else:
-            # Radial roughness stands in for normal variance when we only have
-            # a point cloud: a flat wall has near-constant radius, a facade with
-            # recessed windows and trim does not.
-            variance = float(np.std(rad[sel]) / max(np.mean(rad[sel]), 1e-6))
+            variance = float(np.std(depth[sel]) / max(half.min(), 1e-9))
 
         scores[k] = density * (1.0 + variance) * (1.0 + z_spread)
 
@@ -306,16 +313,30 @@ def choose_orientation(fp: Footprint,
     if normal is not None:
         chosen = _closest_candidate_to_facing(fp, mo, viable, normal)
         if chosen is not None:
-            if vertices_canonical is not None:
+            # Facade detail may only CORROBORATE the road choice, and only if it
+            # agrees with it. The detail cue says which side of the mesh is the
+            # detailed (photographed) one; that has to be the front facade the
+            # road-facing candidate points at the street. Previously any spread
+            # above 0.05 upgraded the label without comparing sides at all.
+            if vertices_canonical is not None and mo.front_angle is not None:
                 detail = facade_detail_scores(vertices_canonical)
                 detailed_side = int(np.argmax(detail))
                 spread = float(detail.max() - np.median(detail))
-                if spread > 0.05:
+                side_angle = detailed_side * math.pi / 2.0   # +X, +Y, -X, -Y
+                off = abs(math.atan2(math.sin(side_angle - mo.front_angle),
+                                     math.cos(side_angle - mo.front_angle)))
+                if spread > 0.05 and off < math.pi / 4:
                     reasons.append(
-                        f"facade detail concentrated on side {detailed_side} "
-                        f"(spread {spread:.3f})"
+                        f"facade detail on the front side corroborates the street "
+                        f"prior (side {detailed_side}, spread {spread:.3f})"
                     )
                     return done(chosen, Disambiguator.FACADE_DETAIL)
+                if spread > 0.05:
+                    reasons.append(
+                        f"facade detail is concentrated on side {detailed_side}, "
+                        f"{math.degrees(off):.0f} deg from the mesh front — it "
+                        "does not corroborate the street prior"
+                    )
             reasons.append(
                 "orientation from the street-facing prior alone — this is a "
                 "prior, not evidence; flagged regardless of IoU (spec 6.6)"

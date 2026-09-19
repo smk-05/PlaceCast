@@ -316,3 +316,56 @@ def test_osm_still_beats_both():
                                    depth_estimate=19.0, microsoft_height=11.3)
     assert src is HeightSource.OSM_HEIGHT and h == pytest.approx(20.7)
     assert any("Microsoft" in n and "disagrees" in n for n in notes)
+
+
+# --------------------------------------------------------------------------
+# Facade detail must corroborate the street prior, not just relabel it
+# --------------------------------------------------------------------------
+
+
+def _walls_with_detail(detail_angle, n=4000, seed=1):
+    """Canonical-frame points on the walls of a 40 x 20 x 10 box, plus a dense
+    cluster of 'windows and trim' on the side at `detail_angle`."""
+    rng = np.random.default_rng(seed)
+    t = rng.uniform(0, 1, n)
+    side = rng.integers(0, 4, n)
+    x = np.where(side == 0, 20, np.where(side == 2, -20, -20 + 40 * t))
+    y = np.where(side == 1, 10, np.where(side == 3, -10, -10 + 20 * t))
+    walls = np.c_[x, y, rng.uniform(0, 10, n)]
+    d = np.array([math.cos(detail_angle), math.sin(detail_angle)])
+    pos = d * np.array([20, 10])
+    along = np.array([-d[1], d[0]]) * np.array([20, 10])
+    k = n
+    s = rng.uniform(-0.9, 0.9, k)
+    cluster = np.c_[pos[0] + along[0] * s, pos[1] + along[1] * s, rng.uniform(0, 10, k)]
+    return np.vstack([walls, cluster])
+
+
+def _street_choice(detail_angle):
+    pts = _rect(40, 20)
+    fp, mo = _fp(pts), _mo(pts, front=-math.pi / 2)          # front faces canonical -Y
+    scored = score_candidates(fp, mo, ombb_candidates(fp, mo))
+    road = [np.array([[-100.0, -45.0], [100.0, -45.0]])]      # a street to the south
+    return choose_orientation(fp, mo, scored, roads_enu=road,
+                              vertices_canonical=_walls_with_detail(detail_angle))
+
+
+def test_detail_on_the_front_corroborates():
+    choice = _street_choice(-math.pi / 2)                     # detail on the front
+    assert choice.disambiguated_by is Disambiguator.FACADE_DETAIL
+
+
+def test_detail_on_the_back_does_not_upgrade_the_label():
+    choice = _street_choice(+math.pi / 2)                     # detail on the BACK
+    assert choice.disambiguated_by is Disambiguator.ROAD_NORMAL
+    assert any("does not corroborate" in r for r in choice.reasons)
+
+
+def test_no_front_means_no_corroboration():
+    pts = _rect(40, 20)
+    fp, mo = _fp(pts), _mo(pts, front=None)
+    scored = score_candidates(fp, mo, ombb_candidates(fp, mo))
+    choice = choose_orientation(fp, mo, scored,
+                                roads_enu=[np.array([[-100.0, -45.0], [100.0, -45.0]])],
+                                vertices_canonical=_walls_with_detail(-math.pi / 2))
+    assert choice.disambiguated_by is not Disambiguator.FACADE_DETAIL

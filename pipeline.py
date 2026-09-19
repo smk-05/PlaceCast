@@ -139,7 +139,11 @@ def run(address: str,
         building_lat=poly_lonlat.centroid.y,
         building_lon=poly_lonlat.centroid.x,
         roads_enu=roads_enu,
-        vertices_canonical=mesh_vertices,
+        # CANONICAL vertices: facade_detail_scores reads sides in the canonical
+        # XY plane. Raw glTF vertices are Y-up, which made its "sides"
+        # meaningless (NCB reported an implausible 0.927 spread).
+        vertices_canonical=(outline.canonicalise(mesh_vertices, mo.up_axis_idx)[0]
+                            if mesh_vertices is not None else None),
     )
     log(f"orientation: k={chosen.azimuth_k} via {by.value}")
     for r in reasons:
