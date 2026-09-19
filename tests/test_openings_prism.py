@@ -179,6 +179,20 @@ def test_a_raised_door_goes_to_review_but_a_raised_window_does_not():
     assert door["bottom_above_ground_m"] == pytest.approx(1.5, abs=0.05)
 
 
+def test_implausible_sizes_go_to_review_as_a_grazing_view():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    ops = [_on_south("win_wide", cam, mask, -4.0, z0=2.0, w=5.0, h=1.5, type_="window"),
+           _on_south("win_ok", cam, mask, 6.0, z0=2.0, w=3.0, h=1.5, type_="window"),
+           _on_south("door_wide", cam, mask, 0.0, z0=0.05, w=5.0, h=2.0, type_="door"),  # only windows have a width cap
+           _on_south("tall", cam, mask, 8.0, z0=0.05, w=1.0, h=7.0, type_="door")]
+    wide, ok, door, tall = _place(prism, cam, mask, ops).openings
+    assert wide["width_m"] == pytest.approx(5.0, abs=0.1) and tall["height_m"] == pytest.approx(7.0, abs=0.1)
+    assert wide["decision"] == "REVIEW" and "implausible size (grazing view)" in wide["reasons"]
+    assert tall["decision"] == "REVIEW" and "implausible size (grazing view)" in tall["reasons"]
+    assert ok["decision"] == "ACCEPT" and door["decision"] == "ACCEPT"
+
+
 def test_roof_hit_and_miss_go_to_review_and_other_is_skipped():
     prism = _prism()
     cam = _camera(0, -40, 0.0, z=30.0, pitch=-15.0)  # a camera above the roof line sees the roof
@@ -197,8 +211,8 @@ def test_roof_hit_and_miss_go_to_review_and_other_is_skipped():
 
 
 # A small search grid for the tests that are not about the grid itself: yaw +-15 (default), position +-2 m in one
-# 2 m step, pitch +-2, no focal scaling, no fine stage, one process.
-NARROW = {"pos_range": 2.0, "pos_step": 2.0, "refine_step": None, "pitch_range": 2.0, "scales": (1.0,), "workers": 1}
+# 2 m step, pitch 0-2, no focal scaling, no fine stage, one process.
+NARROW = {"pos_range": 2.0, "pos_step": 2.0, "refine_step": None, "pitches": (0.0, 1.0, 2.0), "scales": (1.0,), "workers": 1}
 
 
 def test_ten_degrees_of_yaw_error_is_recovered():
@@ -226,7 +240,7 @@ def test_a_wrong_focal_length_is_recovered_as_a_scale():
     mask = _mask(prism, true)
     # An EXIF focal 10% too long: the fit should scale it back by ~0.91, i.e. the 0.90 step. Position, yaw and
     # pitch are pinned so nothing else can absorb the error.
-    fit = op.fit_camera(prism, mask, true.moved(scale=1.10), yaw_range=0.0, pitch_range=0.0, pos_range=0.0,
+    fit = op.fit_camera(prism, mask, true.moved(scale=1.10), yaw_range=0.0, pitches=(0.0,), pos_range=0.0,
                         workers=1)
     assert fit.focal_scale == pytest.approx(0.90) and fit.iou > 0.95 and fit.iou_initial < 0.9
     assert fit.camera.f_px == pytest.approx(F_PX * 1.10 * 0.90)
@@ -234,18 +248,39 @@ def test_a_wrong_focal_length_is_recovered_as_a_scale():
     assert fit.to_dict()["focal_scale"] == pytest.approx(0.90)
 
 
+def test_pitch_is_searched_upward_from_the_horizon():
+    prism = _prism()
+    true = _camera(0, -40, 0.0, pitch=8.0)
+    mask = _mask(prism, true)
+    # No EXIF pitch (0): the fit finds the nearest 2.5 deg step to the true 8 deg, and 0 is not an edge.
+    fit = op.fit_camera(prism, mask, true.moved(pitch_deg=-8.0), yaw_range=0.0, pos_range=0.0, scales=(1.0,),
+                        workers=1)
+    assert fit.camera.pitch_deg == pytest.approx(7.5) and fit.iou > 0.9 and fit.at_edge == ()
+    level = _camera(0, -40, 0.0)
+    flat = op.fit_camera(prism, _mask(prism, level), level, yaw_range=0.0, pos_range=0.0, scales=(1.0,), workers=1)
+    assert flat.camera.pitch_deg == 0.0 and "pitch" not in flat.at_edge  # the floor is not an edge
+
+
+def test_a_pitch_beyond_the_top_of_the_grid_is_an_edge_hit():
+    prism = _prism()
+    true = _camera(0, -40, 0.0, pitch=22.0)
+    fit = op.fit_camera(prism, _mask(prism, true), true.moved(pitch_deg=-22.0), yaw_range=0.0, pos_range=0.0,
+                        scales=(1.0,), workers=1)
+    assert fit.camera.pitch_deg == 15.0 and "pitch" in fit.at_edge and not fit.reliable
+
+
 def test_position_is_refined_to_one_metre_inside_the_coarse_step():
     prism, true = _prism(), _camera(0, -40, 0.0)
     mask = _mask(prism, true)
     # 6 m east of the truth: the 4 m grid has -4 and -8, the 1 m stage must land on -6.
-    fit = op.fit_camera(prism, mask, true.moved(dx=6.0), yaw_range=0.0, pitch_range=0.0, scales=(1.0,), workers=1)
+    fit = op.fit_camera(prism, mask, true.moved(dx=6.0), yaw_range=0.0, pitches=(0.0,), scales=(1.0,), workers=1)
     assert (fit.dx_m, fit.dy_m) == pytest.approx((-6.0, 0.0)) and fit.iou > 0.99 and fit.at_edge == ()
 
 
 def test_the_parallel_grid_gives_the_same_fit_as_the_sequential_one():
     prism, true = _prism(), _camera(0, -40, 0.0)
     mask = _mask(prism, true)
-    kw = {"yaw_range": 5.0, "pitch_range": 0.0}  # 11 x 81 x 7 = 6237 coarse candidates: over the parallel threshold
+    kw = {"yaw_range": 10.0, "pitches": (0.0,), "pos_range": 8.0}  # 21 x 25 x 9 = 4725 candidates: parallel
     start = true.moved(yaw_deg=3.0, dx=2.0, scale=1.05)
     a = op.fit_camera(prism, mask, start, workers=1, **kw)
     b = op.fit_camera(prism, mask, start, workers=2, **kw)
@@ -258,7 +293,7 @@ def test_a_best_value_on_the_grid_edge_sends_every_opening_to_review():
     opening = _on_south("w1", true, mask, cx=3.0, z0=3.0)
     # 6 m east of the truth but searched only +-4 m: the optimum is outside the grid.
     result = op.place_openings_on_prism(prism, None, mask, [opening], camera=true.moved(dx=6.0),
-                                        fit_kwargs={**NARROW, "pos_range": 4.0, "pitch_range": 1.0, "yaw_range": 2.0})
+                                        fit_kwargs={**NARROW, "pos_range": 4.0, "yaw_range": 2.0})
     assert not result.fit.reliable and "east" in result.fit.at_edge
     r, = result.openings
     assert r["decision"] == "REVIEW" and any("edge of the search grid" in why for why in r["reasons"])

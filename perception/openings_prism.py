@@ -27,13 +27,17 @@ defined on the frame DIAGONAL (43.27 mm): f_px = f35 * diag_px / 43.27.
 
 Refinement (fit_camera). The prism is projected into the image and its silhouette scored against the building mask
 by plain IoU (position and scale matter here: the camera is metric, unlike perception/render_compare's normalised
-score), over yaw +-15 deg (1 deg), east/north +-16 m (4 m), pitch +-5 deg (1 deg) and a focal-length scale of
-0.85-1.15 (0.05): the EXIF focal length is a nominal value, and the fit otherwise trades a wrong focal length for a
-wrong distance. The best coarse candidate is then refined in position only, at 1 m within one coarse step. A best
-value on the edge of any axis (yaw, pitch, east, north or focal scale) means the optimum is outside the grid, so it
-is not trusted. camera_iou < MIN_CAMERA_IOU or an edge value sends every opening from the photo to REVIEW; a photo
-that still fails is REVIEW and the grid is not widened further. The coarse grid is ~193k silhouettes, scored in
-parallel worker processes (up to 8).
+score), over yaw +-15 deg (1 deg), east/north +-24 m (4 m), pitch 0 to +15 deg (2.5 deg) and a focal-length scale
+of 0.80-1.20 (0.05): the EXIF focal length is a nominal value, and the fit otherwise trades a wrong focal length for
+a wrong distance; pitch is absolute because phones tilt up at tall buildings and carry no EXIF pitch. The best
+coarse candidate is then refined in position only, at 1 m within one coarse step. A best value on the edge of any
+axis (yaw, east, north, focal scale, or the TOP of the pitch grid; pitch 0 is a floor, not an edge) means the
+optimum is outside the grid, so it is not trusted. camera_iou < MIN_CAMERA_IOU or an edge value sends every opening from the photo to REVIEW; a photo
+that still fails is REVIEW and the grid is not widened further (camera work is frozen). The coarse grid is ~330k
+silhouettes, scored in parallel worker processes (up to 8).
+
+Size sanity. A window wider than 4 m, or any opening taller than 6 m, is REVIEW ("implausible size (grazing view)"):
+at a grazing angle the corner rays stretch a box along the wall.
 
 Placement. Perspective rays from the camera through each opening's centre and four box corners hit the prism
 (trimesh extrusion of the ENU footprint); the first hit is the surface. A wall hit is mapped to the footprint edge
@@ -79,9 +83,13 @@ from perception.openings_3d import (  # noqa: E402  (the rules and the extras se
 
 CAMERA_HEIGHT_M = 1.5
 YAW_RANGE_DEG, YAW_STEP_DEG = 15.0, 1.0
-POS_RANGE_M, POS_STEP_M, REFINE_STEP_M = 16.0, 4.0, 1.0
-PITCH_RANGE_DEG, PITCH_STEP_DEG = 5.0, 1.0
-FOCAL_SCALES = (0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15)  # x the EXIF-derived focal length in pixels
+POS_RANGE_M, POS_STEP_M, REFINE_STEP_M = 24.0, 4.0, 1.0
+# Absolute pitch above the horizon. Phones are tilted up at tall buildings and carry no EXIF pitch; 0 is the floor
+# (a level camera), so a best value at 0 is not an edge hit, only one at the top of the grid is.
+PITCH_GRID_DEG = (0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0)
+FOCAL_SCALES = (0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20)  # x the EXIF-derived focal length in pixels
+MAX_WINDOW_WIDTH_M = 4.0
+MAX_OPENING_HEIGHT_M = 6.0
 MIN_CAMERA_IOU = 0.6
 DOOR_MAX_BOTTOM_M = 1.0
 DOOR_TYPES = ("door", "entrance", "garage_door")
@@ -366,12 +374,12 @@ def _first_best(candidates, scores, floor_iou):
     return best, best_iou
 
 
-def fit_camera(prism, mask, camera, *, refine=True, yaw_range=YAW_RANGE_DEG, pitch_range=PITCH_RANGE_DEG,
+def fit_camera(prism, mask, camera, *, refine=True, yaw_range=YAW_RANGE_DEG, pitches=PITCH_GRID_DEG,
                pos_range=POS_RANGE_M, pos_step=POS_STEP_M, refine_step=REFINE_STEP_M, scales=FOCAL_SCALES,
                workers=None):
     """Grid-refine the EXIF camera against the building mask. See the module docstring.
 
-    Coarse grid over yaw x pitch x (east, north) x focal scale; then position only, at `refine_step`, within one
+    Coarse grid over yaw x pitch (`pitches`, absolute degrees) x (east, north) x focal scale; then position only, at `refine_step`, within one
     coarse step of the best (never past `pos_range`, so an optimum outside the grid still reads as an edge hit).
     Ties keep the candidate nearest the EXIF camera: candidates are enumerated nearest-first and only a real
     improvement replaces the best. `workers`: processes for the coarse grid (default: up to 8 cores)."""
@@ -386,13 +394,15 @@ def fit_camera(prism, mask, camera, *, refine=True, yaw_range=YAW_RANGE_DEG, pit
     workers = max(1, min(os.cpu_count() or 1, 8)) if workers is None else workers
 
     scales = tuple(sorted(scales, key=lambda s: abs(s - 1.0)))  # nearest 1.0 first
+    dpitches = sorted((p - camera.pitch_deg for p in pitches), key=abs)  # offsets from the camera, nearest first
+    pitch_span = max(abs(d) for d in dpitches) or 1.0
     poss = _offsets(pos_range, pos_step)
     # Candidates are (dyaw, dx, dy, dpitch, scale): the argument order of PinholeCamera.moved.
     coarse = [(dyaw, dx, dy, dpitch, s)
-              for dyaw in _offsets(yaw_range, YAW_STEP_DEG) for dpitch in _offsets(pitch_range, PITCH_STEP_DEG)
+              for dyaw in _offsets(yaw_range, YAW_STEP_DEG) for dpitch in dpitches
               for dx in poss for dy in poss for s in scales]
     coarse.sort(key=lambda c: abs(c[0]) / (yaw_range or 1) + math.hypot(c[1], c[2]) / (pos_range or 1)
-                + abs(c[3]) / (pitch_range or 1) + abs(c[4] - 1.0))  # stable: ties keep grid order
+                + abs(c[3]) / pitch_span + abs(c[4] - 1.0))  # stable: ties keep grid order
     best, best_iou = _first_best(coarse, _score_all(coarse, raster, target, camera, prism, workers), iou0)
     best = best or (0.0, 0.0, 0.0, 0.0, 1.0)
 
@@ -406,9 +416,10 @@ def fit_camera(prism, mask, camera, *, refine=True, yaw_range=YAW_RANGE_DEG, pit
         best, best_iou = found or best, found_iou
 
     dyaw, dx, dy, dpitch, scale = best
-    axes = [("yaw", dyaw, yaw_range), ("pitch", dpitch, pitch_range), ("east", dx, pos_range),
-            ("north", dy, pos_range)]
+    axes = [("yaw", dyaw, yaw_range), ("east", dx, pos_range), ("north", dy, pos_range)]
     edge = [name for name, v, r in axes if r > 0 and abs(v) >= r - 1e-9]
+    if len(dpitches) > 1 and camera.pitch_deg + dpitch >= max(pitches) - 1e-9:  # only the top: 0 is a floor
+        edge.append("pitch")
     if len(scales) > 1 and (scale <= min(scales) + 1e-9 or scale >= max(scales) - 1e-9):
         edge.append("focal scale")
     return CameraFit(camera.moved(dyaw, dx, dy, dpitch, scale), camera, best_iou, iou0, dyaw, dx, dy, dpitch, scale,
@@ -504,6 +515,10 @@ def _place_one(index, op, prism, camera, hits, is_wall, source_photo):
         rec["height_m"] = float((np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2)
     else:
         review(f"{int((~is_wall[1:]).sum())} of 4 corner rays missed the prism or hit the roof: size unreliable")
+    too_wide = op["type"] == "window" and rec["width_m"] is not None and rec["width_m"] > MAX_WINDOW_WIDTH_M
+    too_tall = rec["height_m"] is not None and rec["height_m"] > MAX_OPENING_HEIGHT_M
+    if too_wide or too_tall:  # a grazing view stretches boxes along the wall
+        review("implausible size (grazing view)")
     bottoms = [hits[k, 2] for k in (3, 4) if is_wall[k]]  # BR, BL
     if bottoms:
         rec["bottom_above_ground_m"] = float(np.mean(bottoms))
@@ -632,7 +647,7 @@ def main():
     fit = result.fit
     print(f"camera_iou={fit.iou:.3f} (EXIF camera {fit.iou_initial:.3f}); yaw {fit.camera.yaw_deg % 360:.1f} vs EXIF "
           f"{fit.initial.yaw_deg:.1f} (offset {fit.yaw_offset_deg:+.0f}); position offset "
-          f"({fit.dx_m:+.0f}, {fit.dy_m:+.0f}) m; pitch offset {fit.pitch_offset_deg:+.0f}; "
+          f"({fit.dx_m:+.0f}, {fit.dy_m:+.0f}) m; pitch {fit.camera.pitch_deg:.1f} deg; "
           f"focal scale {fit.focal_scale:.2f}; edge={list(fit.at_edge)} reliable={fit.reliable}")
     for wall, (bearing, ids) in sorted(result.per_wall().items()):
         print(f"  wall {wall}: bearing {bearing:.1f}  {len(ids)} openings")
