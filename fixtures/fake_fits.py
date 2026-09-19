@@ -39,7 +39,16 @@ def _ombb(a: float, b: float, angle: float = 0.0) -> OMBB:
 
 
 def make_footprint(rectilinearity: float, aspect: float = 1.6,
-                   area: float = 800.0) -> Footprint:
+                   area: float = 800.0,
+                   match_quality: str = "contained_and_named") -> Footprint:
+    """A synthetic footprint.
+
+    `match_quality` defaults to the strong case. It is NOT cosmetic: an empty
+    value means "unverified" and routes to review on its own, because a footprint
+    accepted on thin evidence taints every metric computed against it. A high IoU
+    against the wrong building is the most dangerous output this pipeline can
+    produce, since it looks exactly like success.
+    """
     a = float(np.sqrt(area * aspect))
     b = float(area / a)
     pts = np.array([[0, 0], [a, 0], [a, b], [0, b]], dtype=float)
@@ -49,6 +58,7 @@ def make_footprint(rectilinearity: float, aspect: float = 1.6,
         principal_angle=0.0,
         ombb=_ombb(max(a, b), min(a, b)),
         area_m2=area,
+        match_quality=match_quality,
     )
 
 
@@ -135,6 +145,22 @@ def generate(n: int = 140, seed: int = 42) -> list[tuple[FitResult, Footprint, i
             authoritative_height=False,
         )
         rows.append((fit, make_footprint(rect), 0))
+
+    # The dangerous class: a GOOD-LOOKING fit against a footprint that was
+    # matched on thin evidence. Every metric reads healthy and the building may
+    # simply be the wrong one — observed live, where a demolished Randolph Hall
+    # selected a 360 m2 wind tunnel 46 m away. `match_quality` is the only
+    # feature that separates these from genuine accepts, so the training set has
+    # to contain them or the model cannot learn to distrust them.
+    for _ in range(int(n * 0.08)):
+        fit = make_fit(
+            iou=float(rng.uniform(0.74, 0.90)),
+            hausdorff=float(rng.uniform(0.8, 2.4)),
+            area_ratio=float(rng.normal(1.0, 0.06)),
+            margin=float(rng.uniform(0.10, 0.30)),
+        )
+        rows.append((fit, make_footprint(float(rng.uniform(0.75, 0.98)),
+                                         match_quality="unnamed_sole_candidate"), 0))
 
     # Addendum B.2's free negatives: deliberate corruptions. A mirrored mesh, a
     # 2x scale error, a known-wrong orientation. These populate the reject class

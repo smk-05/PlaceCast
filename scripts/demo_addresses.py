@@ -14,13 +14,15 @@ buildings the judges will recognise.
 """
 
 # MEASURED values, from scripts/prefetch_footprints.py against live OSM on
-# 2026-09-19. These replace the guesses this file originally carried, two of
-# which were wrong: Goodwin is not near-square (aspect 1.26) and Moss Arts is
-# not organic (OSM maps it as a clean rectangle, R = 1.000).
+# 2026-09-19, AFTER the multi-way ring-stitching fix. Do not trust any earlier
+# figures for the two relations: Burruss and Torgersen were both truncated to
+# their first member way, which understated Burruss by 29% and inverted its
+# rectilinearity (0.713 -> 1.000, because the missing wings made the partial
+# ring look irregular).
 DEMO = [
     # addr                                    area    R      aspect  height
-    "Burruss Hall, Blacksburg, VA",          # 4384  0.713   1.53   20.7 m tag
-    "Torgersen Hall, Blacksburg, VA",        # 3964  0.871   1.43   6 levels
+    "Burruss Hall, Blacksburg, VA",          # 6136  1.000   1.44   20.7 m tag
+    "Torgersen Hall, Blacksburg, VA",        # 5353  0.919   2.42   6 levels
     "Goodwin Hall, Blacksburg, VA",          # 4068  0.999   1.26   4 levels
     "Classroom Building, Blacksburg, VA",    # 2272  0.993   2.22   3 levels  <- NCB
     "Moss Arts Center, Blacksburg, VA",      # 7897  1.000   1.08   NO TAG
@@ -29,16 +31,19 @@ DEMO = [
 # Why this set, given the measurements:
 #   NCB          aspect 2.22, R 0.993 — the easy case, and judging happens in
 #                it. This one has to land.
-#   Burruss      R 0.713 is the lowest of the five: wings, so the OMBB box
-#                overshoots and Hausdorff catches what IoU misses. It also has
-#                an explicit `height` tag, so it exercises tier 1 of spec 7.
+#   Burruss      the largest relation in the demo set and the one that exercises
+#                multi-way ring stitching. R 1.000 once assembled correctly, and
+#                it carries an explicit `height` tag, so it exercises tier 1 of
+#                spec 7. If this ever reads 4384 m2 again, the stitching broke.
 #   Moss Arts    aspect 1.08 is BELOW spec 6.6 Filter 1's 1.1 cutoff, so the
 #                90-degree candidates cannot be excluded on scale grounds. This
 #                is the genuinely ambiguous case and the whole disambiguation
 #                chain has to carry it. It also has NO height tag, so it
 #                exercises spec 7's fallback. The best demo in the set.
-#   Torgersen    R 0.871, complex plan, bridge over Alumni Mall.
-#   Goodwin      clean rectilinear control.
+#   Torgersen    R 0.919 is the lowest of the five — a genuinely complex plan
+#                with the bridge over Alumni Mall.
+#   Goodwin      clean rectilinear control, and a plain way rather than a
+#                relation, so it isolates solver bugs from parsing bugs.
 
 # Spec 11's four strata. Hand-annotate ground truth for each by manually
 # aligning a reference box; the resulting rows are also addendum B's training
@@ -53,7 +58,12 @@ DEMO = [
 BENCHMARK_RECTANGULAR = [
     "Burruss Hall, Blacksburg, VA",
     "McBryde Hall, Blacksburg, VA",
-    "Randolph Hall, Blacksburg, VA",
+    # Randolph Hall removed: it is DEMOLISHED. OSM now carries "Randolph Hall
+    # Demolition, Mitchell Hall Construction" at that point and no building
+    # polygon, so the selection rule correctly refuses it. That is a bad
+    # benchmark entry, not a solver failure — benchmarking it would measure
+    # nothing. Verified live 2026-09-19.
+    "Major Williams Hall, Blacksburg, VA",
     "Whittemore Hall, Blacksburg, VA",
     "Hancock Hall, Blacksburg, VA",
 ]
@@ -75,6 +85,10 @@ BENCHMARK_NEAR_SQUARE = [
 ]
 
 BENCHMARK_SLOPED = [
+    # Lane Stadium is also the MULTI-PART case: relation/2417911 is four
+    # disjoint outer rings (the stands) with the field as a genuine gap, so the
+    # geocoded point is honestly not contained by the footprint. Keep it — it is
+    # the only benchmark entry exercising MultiPolygon handling.
     "Lane Stadium, Blacksburg, VA",
     "Cassell Coliseum, Blacksburg, VA",
     "War Memorial Hall, Blacksburg, VA",

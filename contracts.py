@@ -154,17 +154,36 @@ class Footprint:
     in PlacementRecord.footprint_geojson, not here.
     """
 
-    pts_enu: np.ndarray                          # (N,2) metres, outer ring, CCW
+    pts_enu: np.ndarray                          # (N,2) metres, LARGEST outer ring
     holes_enu: tuple[np.ndarray, ...] = ()       # interior rings (spec 3.3)
+    # Additional DISJOINT outer rings, largest-first. Spec 3.3 covers holes but
+    # not multi-part buildings; Lane Stadium's four stands, with the field as a
+    # genuine gap between them, need this. Use geo.footprint.to_shapely() for
+    # anything that measures area or overlap — reading pts_enu alone silently
+    # drops these parts.
+    parts_enu: tuple[np.ndarray, ...] = ()
     rectilinearity: float = 0.0                  # spec 4.2, in [0,1]
     principal_angle: float = 0.0                 # spec 4.2 theta*, mod pi/2
-    ombb: OMBB | None = None                     # spec 4.4
-    area_m2: float = 0.0
+    ombb: OMBB | None = None                     # spec 4.4, of the largest part
+    area_m2: float = 0.0                         # ALL parts
     source: str = "osm"                          # "osm" | "microsoft"
+    # How confidently this polygon was matched to the address (spec 3.2).
+    # "contained_and_named" | "contained" | "name_match" | "unnamed_sole_candidate"
+    # A feature for the confidence model, alongside geocode_rooftop.
+    match_quality: str = ""
 
     @property
     def has_holes(self) -> bool:
         return len(self.holes_enu) > 0
+
+    @property
+    def is_multipart(self) -> bool:
+        return len(self.parts_enu) > 0
+
+    @property
+    def is_weak_match(self) -> bool:
+        """True when the footprint was accepted on thin evidence (spec 3.2)."""
+        return self.match_quality in ("unnamed_sole_candidate", "")
 
     @property
     def is_ill_posed(self) -> bool:

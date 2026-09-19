@@ -40,17 +40,22 @@ THRESHOLDS = {
 }
 
 
-def symmetric_hausdorff(a: Polygon, b: Polygon) -> float:
-    """max( sup_{p in dA} d(p, dB), sup_{q in dB} d(q, dA) ), in metres."""
+def symmetric_hausdorff(a, b) -> float:
+    """max( sup_{p in dA} d(p, dB), sup_{q in dB} d(q, dA) ), in metres.
+
+    Uses `.boundary` rather than `.exterior` so MultiPolygon footprints work —
+    a multi-part building has no single exterior ring.
+    """
     if a.is_empty or b.is_empty:
         return float("inf")
-    return float(max(a.exterior.hausdorff_distance(b.exterior),
-                     b.exterior.hausdorff_distance(a.exterior)))
+    ba, bb = a.boundary, b.boundary
+    return float(max(ba.hausdorff_distance(bb), bb.hausdorff_distance(ba)))
 
 
 def compute_metrics(fp: Footprint, mo: MeshOutline, params: dict) -> dict:
     """The spec 9.1 metric set for one placement."""
-    target = _poly(fp.pts_enu, fp.holes_enu)
+    from geo.fit import _target_geom
+    target = _target_geom(fp)
     moved = apply_similarity(mo.pts_enu, params["theta"], params["sx"],
                              params["sy"], params["t"])
     holes = tuple(apply_similarity(h, params["theta"], params["sx"],
@@ -144,6 +149,26 @@ def threshold_decision(fit: FitResult, fp: Footprint) -> tuple[float, Decision, 
     elif fit.max_neighbor_overlap > t["neighbor_overlap"]["accept"]:
         review = True
         reasons.append(f"neighbour overlap {fit.max_neighbor_overlap:.3f} above auto-accept")
+
+    # Spec 3.2: a footprint accepted on thin evidence taints every metric above
+    # it — a high IoU against the WRONG building is the most dangerous output
+    # this pipeline can produce, because it looks like success.
+    if fp.match_quality == "unnamed_sole_candidate":
+        review = True
+        reasons.append(
+            "footprint matched only as the sole nearby candidate, with no name "
+            "match — verify it is the right building before accepting"
+        )
+    elif not fp.match_quality:
+        review = True
+        reasons.append("footprint match quality unrecorded — treat as unverified")
+
+    if fp.is_multipart:
+        review = True
+        reasons.append(
+            f"multi-part footprint ({1 + len(fp.parts_enu)} disjoint outer rings) "
+            "— the OMBB and rotation come from the largest part only"
+        )
 
     # Spec 1.2: reflections are rejected outright, never accepted as a mirror.
     if fit.is_mirrored:

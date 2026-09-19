@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import requests
-from shapely.geometry import Polygon, shape
+from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import orient
 
 from contracts import OMBB, Footprint
@@ -172,12 +172,87 @@ def fetch_osm(lat: float, lon: float, *, radius: int = 60, road_radius: int = 12
     ) from last_exc
 
 
-def _element_to_polygon(el: dict) -> Polygon | None:
-    """OSM way/relation -> shapely Polygon in (lon, lat), interior rings intact.
+def _stitch_rings(members: list[dict], role: str) -> list[list[tuple]]:
+    """Assemble OSM multipolygon member ways into closed rings.
 
-    Spec 3.3: courtyard buildings arrive as polygons with interior rings and OSM
-    multipolygon relations encode them as outer/inner members. Every area, IoU
-    and boundary distance downstream must respect them.
+    THIS IS THE STEP THAT IS EASY TO GET WRONG, AND GETTING IT WRONG IS SILENT.
+
+    A single outer ring is routinely SPLIT across several member ways that must
+    be stitched end-to-end. Burruss Hall (relation/1074686) is exactly this: four
+    `outer` members, none of them closed, chaining A->B->C->D->A into one ring.
+
+    So neither shortcut works:
+      - taking members[0] yields a truncated building (what this code did before,
+        and it silently shrank Burruss from 6350 to 4384 m2);
+      - treating each member as its own ring yields four degenerate slivers.
+
+    Lane Stadium (relation/2417911) shows both shapes at once: members 0 and 1
+    are open segments that stitch into one ring, while 2, 3 and 4 are already
+    closed rings. It is four disjoint parts, not five.
+
+    Returns a list of closed coordinate rings.
+    """
+    segments: list[list[tuple]] = []
+    for m in members:
+        if m.get("role") != role:
+            continue
+        g = m.get("geometry") or []
+        if len(g) < 2:
+            continue
+        segments.append([(p["lon"], p["lat"]) for p in g])
+
+    rings: list[list[tuple]] = []
+    pending = [s for s in segments]
+
+    while pending:
+        chain = pending.pop(0)
+
+        # Already a closed way — nothing to stitch.
+        if chain[0] == chain[-1]:
+            if len(chain) >= 4:
+                rings.append(chain)
+            continue
+
+        # Walk the open segments, joining whichever one continues the chain at
+        # either end, flipping it if necessary, until the chain closes.
+        progress = True
+        while progress and chain[0] != chain[-1]:
+            progress = False
+            for i, seg in enumerate(pending):
+                if seg[0] == chain[-1]:
+                    chain = chain + seg[1:]
+                elif seg[-1] == chain[-1]:
+                    chain = chain + seg[-2::-1]
+                elif seg[-1] == chain[0]:
+                    chain = seg[:-1] + chain
+                elif seg[0] == chain[0]:
+                    chain = seg[::-1][:-1] + chain
+                else:
+                    continue
+                pending.pop(i)
+                progress = True
+                break
+
+        if chain[0] == chain[-1] and len(chain) >= 4:
+            rings.append(chain)
+        elif len(chain) >= 4:
+            # Unclosed after exhausting candidates: a genuinely broken relation.
+            # Close it explicitly rather than dropping the geometry, but this is
+            # worth surfacing — see `ring_warnings` on the returned Footprint.
+            rings.append(chain + [chain[0]])
+
+    return rings
+
+
+def _element_to_polygon(el: dict) -> Polygon | MultiPolygon | None:
+    """OSM way/relation -> shapely geometry in (lon, lat), rings intact.
+
+    Spec 3.3 covers polygons with interior rings (courtyards). Relations with
+    multiple DISJOINT OUTER rings are a separate case the spec does not name —
+    Lane Stadium's four stands, with the field as a genuine gap between them —
+    and they need a MultiPolygon, not a Polygon. Every area computation, IoU and
+    boundary distance downstream has to be MultiPolygon-aware, not merely
+    hole-aware.
     """
     if el.get("type") == "way":
         geom = el.get("geometry") or []
@@ -185,41 +260,75 @@ def _element_to_polygon(el: dict) -> Polygon | None:
             return None
         ring = [(p["lon"], p["lat"]) for p in geom]
         try:
-            return Polygon(ring)
+            p = Polygon(ring)
+            return p if p.is_valid else p.buffer(0)
         except Exception:  # noqa: BLE001
             return None
 
-    if el.get("type") == "relation":
-        outers, inners = [], []
-        for m in el.get("members", []):
-            g = m.get("geometry") or []
-            if len(g) < 4:
-                continue
-            ring = [(p["lon"], p["lat"]) for p in g]
-            (outers if m.get("role") == "outer" else inners).append(ring)
+    if el.get("type") != "relation":
+        return None
+
+    members = el.get("members", [])
+    outer_rings = _stitch_rings(members, "outer")
+    inner_rings = _stitch_rings(members, "inner")
+    if not outer_rings:
+        return None
+
+    try:
+        outers = [Polygon(r) for r in outer_rings if len(r) >= 4]
+        outers = [p for p in outers if p.is_valid and p.area > 0]
         if not outers:
             return None
-        try:
-            return Polygon(outers[0], inners)
-        except Exception:  # noqa: BLE001
-            return None
-    return None
+
+        inners = [Polygon(r) for r in inner_rings if len(r) >= 4]
+        inners = [p for p in inners if p.is_valid and p.area > 0]
+
+        # Assign each interior ring to the outer ring that contains it, rather
+        # than attaching every hole to every part.
+        parts = []
+        for o in outers:
+            holes = [list(h.exterior.coords) for h in inners
+                     if o.contains(h.representative_point())]
+            parts.append(Polygon(list(o.exterior.coords), holes))
+
+        geom = parts[0] if len(parts) == 1 else MultiPolygon(parts)
+        return geom if geom.is_valid else geom.buffer(0)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def select_footprint(payload: dict, lat: float, lon: float,
-                     address: str = "") -> tuple[dict, Polygon, list[Polygon]]:
-    """Spec 3.2's selection rule. -> (element, polygon, neighbour_polygons).
+                     address: str = "", *, max_distance_m: float = 50.0
+                     ) -> tuple[dict, Polygon | MultiPolygon, list]:
+    """Spec 3.2's selection rule. -> (element, geometry, neighbours).
 
-    Explicitly NOT "take the nearest polygon":
-      1. Point-in-polygon against the geocoded point; exactly one hit wins.
-      2. Otherwise candidates within 50 m ranked by tag match, then centroid
-         distance, then area plausibility.
-      3. Zero candidates is an explicit failure. We do not synthesise a footprint.
+    Explicitly NOT "take the nearest polygon", and — the part that is easy to
+    omit — explicitly NOT "take the best-ranked polygon either".
+
+    Spec 3.2 step 2 ranks the candidates but never says what to do when NOTHING
+    matches. Ranking always returns something, so an unconstrained step 2 turns
+    a query that should error into a confidently wrong polygon. Observed:
+    Randolph Hall (demolished, now a construction site) selected the
+    "Virginia Tech Stability Wind Tunnel" — 360 m2, 46 m away, no name match.
+    A wind tunnel standing in for a classroom building produces a plausible IoU
+    against the wrong footprint, which is precisely spec 14's warning that a
+    pipeline quietly substituting a default "will produce a demo that appears
+    to work and is entirely fictitious."
+
+    So the rule here is:
+      1. Containment + name match         -> take it.
+      2. Containment, one candidate only  -> take it.
+      3. Name match within range          -> take it.
+      4. Exactly one building in range    -> take it, tagged as weak evidence.
+      5. Anything else                    -> FAIL. Do not guess.
+
+    The chosen element carries `_match_quality`, which propagates into the
+    placement record and is a feature for the confidence model.
     """
     from shapely.geometry import Point
 
     pt = Point(lon, lat)
-    buildings: list[tuple[dict, Polygon]] = []
+    buildings: list[tuple[dict, Polygon | MultiPolygon]] = []
     for el in payload.get("elements", []):
         if "building" not in (el.get("tags") or {}):
             continue
@@ -234,30 +343,70 @@ def select_footprint(payload: dict, lat: float, lon: float,
             "fail — do not synthesise a footprint (spec 3.2, 14)."
         )
 
+    housenumber = _extract_housenumber(address)
+
+    def names_match(el: dict) -> bool:
+        tags = el.get("tags") or {}
+        if housenumber and tags.get("addr:housenumber") == housenumber:
+            return True
+        name = (tags.get("name") or "").strip().lower()
+        if not name or not address:
+            return False
+        addr = address.lower()
+        if name in addr:
+            return True
+        # "Classroom Building" vs "New Classroom Building": accept when the
+        # significant words of the OSM name are all present in the query.
+        words = [w for w in name.replace(",", " ").split()
+                 if len(w) > 3 and w not in ("hall", "building", "center", "centre")]
+        return bool(words) and all(w in addr for w in words)
+
+    # MultiPolygon-aware containment: inside any outer ring and not inside a
+    # hole. shapely handles this correctly for MultiPolygon.contains().
     containing = [(el, p) for el, p in buildings if p.contains(pt)]
-    if len(containing) == 1:
-        chosen = containing[0]
-    else:
-        pool = containing if containing else buildings
-        housenumber = _extract_housenumber(address)
+    named = [(el, p) for el, p in buildings if names_match(el)]
+    in_range = [(el, p) for el, p in buildings
+                if _distance_m(p, pt) <= max_distance_m]
 
-        def rank(item: tuple[dict, Polygon]) -> tuple:
-            el, poly = item
-            tags = el.get("tags") or {}
-            tag_match = 0
-            if housenumber and tags.get("addr:housenumber") == housenumber:
-                tag_match = -2
-            elif address and tags.get("name") and tags["name"].lower() in address.lower():
-                tag_match = -1
-            # metres, near enough at this latitude for ranking purposes
-            dist = poly.centroid.distance(pt) * 111_000
-            area_penalty = 0.0 if 20 < _approx_area_m2(poly) < 50_000 else 1.0
-            return (tag_match, area_penalty, dist)
+    chosen = None
+    quality = ""
 
-        chosen = min(pool, key=rank)
+    named_and_containing = [c for c in containing if names_match(c[0])]
+    if named_and_containing:
+        chosen, quality = named_and_containing[0], "contained_and_named"
+    elif len(containing) == 1:
+        chosen, quality = containing[0], "contained"
+    elif named:
+        named_in_range = [c for c in named if _distance_m(c[1], pt) <= max_distance_m]
+        if named_in_range:
+            chosen = min(named_in_range, key=lambda c: _distance_m(c[1], pt))
+            quality = "name_match"
+    elif len(in_range) == 1:
+        # The one narrow exception. Weaker evidence, and labelled as such.
+        chosen, quality = in_range[0], "unnamed_sole_candidate"
 
+    if chosen is None:
+        names = sorted({(el.get("tags") or {}).get("name", "?") for el, _ in in_range})
+        raise LookupError(
+            f"Ambiguous footprint for {address!r} at ({lat:.5f}, {lon:.5f}): "
+            f"{len(containing)} polygons contain the point, {len(in_range)} are "
+            f"within {max_distance_m:.0f} m, and none match by name. "
+            f"Candidates: {names or 'none in range'}. "
+            "Refusing to guess (spec 3.2 step 3, spec 14). Either the geocode is "
+            "wrong, the building is absent from OSM, or the address is stale — "
+            "check it by hand rather than letting the solver invent a result."
+        )
+
+    chosen[0]["_match_quality"] = quality
     neighbours = [p for el, p in buildings if el is not chosen[0]]
     return chosen[0], chosen[1], neighbours
+
+
+def _distance_m(geom, pt) -> float:
+    """Boundary distance in metres. 0 when the point is inside."""
+    lat = geom.centroid.y
+    m_per_deg = 111_320.0
+    return float(geom.distance(pt) * m_per_deg * math.cos(math.radians(lat)) ** 0.5)
 
 
 def _extract_housenumber(address: str) -> str:
@@ -393,37 +542,65 @@ def compute_ombb(pts: np.ndarray) -> OMBB:
 # --------------------------------------------------------------------------
 
 
-def build_footprint(polygon_lonlat: Polygon, frame: ENUFrame, *,
+def build_footprint(polygon_lonlat: Polygon | MultiPolygon, frame: ENUFrame, *,
                     simplify_eps: float = 0.4,
-                    source: str = "osm") -> Footprint:
-    """Project an OSM polygon into the ENU frame and condition it. Spec 3-4."""
-    poly = orient(polygon_lonlat, sign=1.0)  # CCW outer ring
+                    source: str = "osm",
+                    match_quality: str = "") -> Footprint:
+    """Project an OSM geometry into the ENU frame and condition it. Spec 3-4.
 
+    Multi-part footprints (Lane Stadium's four stands) keep every part. The
+    LARGEST part drives the OMBB, the principal angle and the rectilinearity,
+    because those are single-orientation quantities and the largest part is the
+    best estimate of the building's axis — but `area_m2` and everything that
+    goes through `to_shapely` cover all parts, so IoU and Hausdorff stay honest.
+    """
     def ring_to_enu(ring) -> np.ndarray:
         arr = np.asarray(ring.coords)[:-1]
         enu = frame.geodetic_to_enu(arr[:, 1], arr[:, 0], 0.0)
         return np.asarray(enu)[:, :2]
 
-    outer = simplify_ring(ring_to_enu(poly.exterior), simplify_eps)
-    holes = tuple(ring_to_enu(r) for r in poly.interiors)
+    geoms = ([polygon_lonlat] if isinstance(polygon_lonlat, Polygon)
+             else list(polygon_lonlat.geoms))
+    geoms = [orient(g, sign=1.0) for g in geoms]           # CCW outer rings
+    geoms.sort(key=lambda g: g.area, reverse=True)
 
-    theta_star, rect = principal_orientation(outer)
-    shapely_poly = Polygon(outer, [h for h in holes])
+    converted = []
+    for g in geoms:
+        outer = simplify_ring(ring_to_enu(g.exterior), simplify_eps)
+        holes = tuple(ring_to_enu(r) for r in g.interiors)
+        converted.append((outer, holes))
+
+    primary_outer, primary_holes = converted[0]
+    extra_parts = tuple(o for o, _ in converted[1:])
+
+    theta_star, rect = principal_orientation(primary_outer)
+    full = MultiPolygon([Polygon(o, list(h)) for o, h in converted]) \
+        if len(converted) > 1 else Polygon(primary_outer, list(primary_holes))
 
     return Footprint(
-        pts_enu=outer,
-        holes_enu=holes,
+        pts_enu=primary_outer,
+        holes_enu=primary_holes,
+        parts_enu=extra_parts,
         rectilinearity=rect,
         principal_angle=theta_star,
-        ombb=compute_ombb(outer),
-        area_m2=float(shapely_poly.area),
+        ombb=compute_ombb(primary_outer),
+        area_m2=float(full.area),
         source=source,
+        match_quality=match_quality,
     )
 
 
-def to_shapely(fp: Footprint) -> Polygon:
-    """Footprint -> shapely Polygon, interior rings intact."""
-    return Polygon(fp.pts_enu, [h for h in fp.holes_enu])
+def to_shapely(fp: Footprint) -> Polygon | MultiPolygon:
+    """Footprint -> shapely geometry, interior rings AND extra parts intact.
+
+    Everything that measures overlap must go through this, not through
+    Polygon(fp.pts_enu), or multi-part buildings silently lose their other
+    parts from the denominator.
+    """
+    primary = Polygon(fp.pts_enu, [h for h in fp.holes_enu])
+    if not fp.parts_enu:
+        return primary
+    return MultiPolygon([primary] + [Polygon(p) for p in fp.parts_enu])
 
 
 def _slug(s: str) -> str:

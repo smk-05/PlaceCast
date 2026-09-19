@@ -49,6 +49,17 @@ def _poly(pts: np.ndarray, holes: tuple[np.ndarray, ...] = ()) -> Polygon:
     return p if p.is_valid else p.buffer(0)
 
 
+def _target_geom(fp: Footprint):
+    """The full footprint geometry, all parts and holes. Never Polygon(pts_enu).
+
+    Multi-part footprints lose their other parts from the IoU denominator if
+    you build the target from pts_enu alone.
+    """
+    from geo.footprint import to_shapely
+    g = to_shapely(fp)
+    return g if g.is_valid else g.buffer(0)
+
+
 def iou(a: Polygon, b: Polygon) -> float:
     if a.is_empty or b.is_empty:
         return 0.0
@@ -104,7 +115,7 @@ def score_candidates(fp: Footprint, mo: MeshOutline,
                      ) -> list[tuple[CandidateId, float]]:
     """Footprint IoU for each candidate. The margin between the top two is the
     spec 6.6 ambiguity signal and goes straight into the confidence model."""
-    target = _poly(fp.pts_enu, fp.holes_enu)
+    target = _target_geom(fp)
     scored = []
     for cid, p in candidates:
         moved = apply_similarity(mo.pts_enu, p["theta"], p["sx"], p["sy"], p["t"])
@@ -219,7 +230,7 @@ def iou_refine(fp: Footprint, mo: MeshOutline, params: dict,
     — symmetric under swapping the axes, scale-invariant, and zero exactly at
     isotropy.
     """
-    target = _poly(fp.pts_enu, fp.holes_enu)
+    target = _target_geom(fp)
     cap = math.log(1.0 + ANISO_EPS)
 
     def unpack(v):

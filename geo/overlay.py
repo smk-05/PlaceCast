@@ -88,6 +88,10 @@ def render_overlay(out_path: Path,
           lw=2.4, fill=True)
     for h in fp.holes_enu:
         _ring(ax, h, FOOTPRINT_COLOUR, None, lw=1.6, ls="--")
+    # Disjoint outer parts (Lane Stadium's stands). Drawn, because a multi-part
+    # footprint that renders as one part looks like a solver bug.
+    for part in fp.parts_enu:
+        _ring(ax, part, FOOTPRINT_COLOUR, None, lw=2.0, fill=True)
 
     placed = apply_similarity(mo.pts_enu, fit.theta, fit.scale_x, fit.scale_y,
                               np.array([fit.tx, fit.ty]))
@@ -127,6 +131,8 @@ def render_overlay(out_path: Path,
         ("area ratio", f"{fit.area_ratio:.3f}", None),
         ("rotation margin", f"{fit.rotation_margin_footprint:.3f}", 0.05),
         ("rectilinearity R", f"{fp.rectilinearity:.3f}", 0.75),
+        ("footprint parts", f"{1 + len(fp.parts_enu)}", None),
+        ("match quality", fp.match_quality or "unknown", None),
         ("anisotropy |log|", f"{fit.anisotropy_log_ratio:.4f}", None),
         ("neighbour overlap", f"{fit.max_neighbor_overlap:.4f}", None),
         ("", "", None),

@@ -74,9 +74,11 @@ def run(address: str,
 
     # ENU anchored at the footprint centroid (spec 2.2)
     frame = ENUFrame(lat0=poly_lonlat.centroid.y, lon0=poly_lonlat.centroid.x)
-    fp = build_footprint(poly_lonlat, frame)
+    fp = build_footprint(poly_lonlat, frame,
+                         match_quality=element.get("_match_quality", ""))
     log(f"conditioned: {len(fp.pts_enu)} verts, {fp.area_m2:.0f} m2, "
-        f"R={fp.rectilinearity:.3f}, aspect={fp.ombb.aspect:.2f}")
+        f"R={fp.rectilinearity:.3f}, aspect={fp.ombb.aspect:.2f}, "
+        f"parts={1 + len(fp.parts_enu)}, match={fp.match_quality}")
     if fp.is_ill_posed:
         log("  WARNING: R < 0.6 — rotation is intrinsically ill-posed (spec 4.2)")
 

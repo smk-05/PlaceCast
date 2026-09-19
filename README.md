@@ -142,28 +142,57 @@ Real numbers from live OSM on 2026-09-19, not estimates.
 
 **Demo set** (`scripts/prefetch_footprints.py`):
 
-| building | area m² | R | aspect | height tag |
-|---|---|---|---|---|
-| Burruss Hall | 4384 | 0.713 | 1.53 | 20.7 m |
-| Torgersen Hall | 3964 | 0.871 | 1.43 | 6 levels |
-| Goodwin Hall | 4068 | 0.999 | 1.26 | 4 levels |
-| New Classroom Building | 2272 | 0.993 | 2.22 | 3 levels |
-| Moss Arts Center | 7897 | 1.000 | 1.08 | **none** |
+| building | OSM | area m² | R | aspect | height tag |
+|---|---|---|---|---|---|
+| Burruss Hall | relation | 6136 | 1.000 | 1.44 | 20.7 m |
+| Torgersen Hall | relation | 5353 | 0.919 | 2.42 | 6 levels |
+| Goodwin Hall | way | 4068 | 0.999 | 1.26 | 4 levels |
+| New Classroom Building | way | 2272 | 0.993 | 2.22 | 3 levels |
+| Moss Arts Center | way | 7897 | 1.000 | 1.08 | **none** |
 
 Moss Arts is the interesting one: aspect 1.08 is *below* spec 6.6 Filter 1's 1.1
 cutoff, so the 90° candidates cannot be excluded on scale grounds and the whole
 disambiguation chain has to carry it. It also has no height tag, so it exercises
-spec 7's fallback. Burruss has the lowest R at 0.713 — it has wings, so the OMBB
-box overshoots and Hausdorff catches what IoU misses.
+spec 7's fallback. Torgersen has the lowest R at 0.919 — a genuinely complex
+plan, with the bridge over Alumni Mall.
 
-**Height coverage** (`scripts/check_height_coverage.py`) — **13/22 = 59%**.
+**Height coverage** (`scripts/check_height_coverage.py`) — **15/22 = 68%**.
 
-This contradicts the addendum's expectation of ≥80% and flips its conditional:
-monocular depth (or the cheaper single-view metrology of addendum C.4) should be
-built, not skipped. The demo five are fine at 4/5; it is the benchmark tail that
-is untagged.
+Below the addendum's 80% threshold, so its conditional flips: monocular depth
+(or the cheaper single-view metrology of C.4) should be built, not skipped. The
+breakdown matters more than the headline — only a third of buildings give metres
+directly, and `building:levels × 3 m` is load-bearing for the rest, so the
+fallback chain is the common path rather than the exception.
+
+Still unchecked: **Microsoft GlobalMLBuildingFootprints**, which carries height
+for 174M+ buildings. If it covers the untagged tail, the depth branch may become
+unnecessary. `geo/height.py:from_microsoft` is written and unwired.
 
 ---
+
+**Three silent footprint bugs**, found on live data and now regression-tested in
+`tests/test_footprint_selection.py`. Each produced a confident, plausible, wrong
+answer rather than an error — the worst failure mode this pipeline has:
+
+1. **Multi-way outer rings were truncated.** OSM routinely splits one outer ring
+   across several member ways that must be stitched end-to-end. Taking the first
+   member shrank Burruss Hall — the primary demo building — from 6136 to 4384 m²
+   and inverted its rectilinearity. Note that "build a MultiPolygon from the
+   outer members" is *also* wrong here: those members are open segments, so it
+   yields four degenerate slivers. Stitch into rings first, then assemble.
+2. **Multi-part relations collapsed to one part.** Lane Stadium is four disjoint
+   stands with the field as a genuine gap; it read 8930 m² instead of 28042.
+   Spec §3.3 covers interior rings but never names this case.
+3. **The §3.2 selection rule guessed instead of failing.** Step 2 ranks
+   candidates, but the spec never says what to do when nothing matches — and
+   ranking always returns something. A demolished Randolph Hall selected the
+   "Stability Wind Tunnel", 360 m², 46 m away, no name match. Selection now
+   fails loudly and names the candidates, with one narrow exception
+   (`unnamed_sole_candidate`) that is tagged as weak evidence and routed to
+   review however good the IoU looks.
+
+`Footprint.match_quality` carries the outcome of (3) into the placement record
+as a confidence feature.
 
 ## Design decisions worth knowing
 
