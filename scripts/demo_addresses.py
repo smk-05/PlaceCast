@@ -1,12 +1,8 @@
 """
 The demo and benchmark building sets. Spec 11, 15.
 
-DEMO: the five addresses rehearsed for judging. Judging is in NCB, so that one
-has to land. Each is chosen to exercise a different part of the solver, and one
-(Moss Arts Center) is chosen to FAIL informatively — it is organic, so its
-rectilinearity R should come in low and the pipeline should flag it for review
-rather than confidently placing it wrong. Demonstrating that is worth more than
-a fifth clean success.
+DEMO: the six addresses photographed on site and rehearsed for judging.
+Judging is in NCB, so that one has to land.
 
 BENCHMARK: spec 11's twenty buildings, stratified by MEASURED shape
 (rectangular / complex / near-square) — see the comment above the lists.
@@ -19,30 +15,26 @@ BENCHMARK: spec 11's twenty buildings, stratified by MEASURED shape
 # rectilinearity (0.713 -> 1.000, because the missing wings made the partial
 # ring look irregular).
 DEMO = [
-    # addr                                    area    R      aspect  height
-    "Burruss Hall, Blacksburg, VA",          # 6136  1.000   1.44   20.7 m tag
-    "Torgersen Hall, Blacksburg, VA",        # 5353  0.919   2.42   6 levels
-    "Goodwin Hall, Blacksburg, VA",          # 4068  0.999   1.26   4 levels
-    "Classroom Building, Blacksburg, VA",    # 2272  0.993   2.22   3 levels  <- NCB
-    "Moss Arts Center, Blacksburg, VA",      # 7897  1.000   1.08   NO TAG
+    # addr                                  R     WxL m    height
+    "Classroom Building, Blacksburg, VA",  # 0.99  35x78   3 levels      <- NCB
+    "Burruss Hall, Blacksburg, VA",        # 1.00  71x102  20.7 m tag
+    "Patton Hall, Blacksburg, VA",         # 1.00  22x65   16.4 m tag
+    "War Memorial Hall, Blacksburg, VA",   # 1.00  98x113  18.8 m tag    near-square
+    "Whittemore Hall, Blacksburg, VA",     # 1.00  43x79   37.4 m tag
+    "Goodwin Hall, Blacksburg, VA",        # 1.00  72x91   4 levels
 ]
 
-# Why this set, given the measurements:
-#   NCB          aspect 2.22, R 0.993 — the easy case, and judging happens in
-#                it. This one has to land.
-#   Burruss      the largest relation in the demo set and the one that exercises
-#                multi-way ring stitching. R 1.000 once assembled correctly, and
-#                it carries an explicit `height` tag, so it exercises tier 1 of
-#                spec 7. If this ever reads 4384 m2 again, the stitching broke.
-#   Moss Arts    aspect 1.08 is BELOW spec 6.6 Filter 1's 1.1 cutoff, so the
-#                90-degree candidates cannot be excluded on scale grounds. This
-#                is the genuinely ambiguous case and the whole disambiguation
-#                chain has to carry it. It also has NO height tag, so it
-#                exercises spec 7's fallback. The best demo in the set.
-#   Torgersen    R 0.919 is the lowest of the five — a genuinely complex plan
-#                with the bridge over Alumni Mall.
-#   Goodwin      clean rectilinear control, and a plain way rather than a
-#                relation, so it isolates solver bugs from parsing bugs.
+# Why this set (2026-09-19, after the benchmark):
+#   NCB          judging happens in it. It has to land. Levels-only height, so
+#                it routes to review once the non-authoritative-height rule is in.
+#   Burruss,     explicit metre `height` tags (spec 7 tier 1) and R = 1.00, the
+#   Patton,      shapes the solver handles cleanly. War Memorial is near-square
+#   War Memorial, (aspect 1.14), so orientation rests on the photo — the case
+#   Whittemore   EXIF exists for.
+#   Goodwin      replaces McBryde, whose R is 0.249 (non-orthogonal wings): the
+#                gate would send it to review whatever photo was taken.
+# Moss Arts, Torgersen: dropped from the demo, still in the benchmark or
+# prefetch cache; no photo walk budget for them.
 
 # Spec 11's strata, assigned from MEASURED shape (scripts/run_benchmark.py,
 # 2026-09-19), not from building names. The name-based guesses were wrong for
