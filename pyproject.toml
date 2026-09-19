@@ -3,6 +3,9 @@ name = "procedura-placement"
 version = "0.1.0"
 description = "Photo -> map-ready 3D building. VTHacks 14 / Procedura AI."
 requires-python = ">=3.11"
+dependencies = [
+    "pillow-heif>=1.7.0",
+]
 
 [tool.pytest.ini_options]
 # Modules live at the repo root (geo/, perception/, ...) and are imported as

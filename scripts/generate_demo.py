@@ -41,7 +41,19 @@ KEYS = {
 }
 
 
+# The shot that gets generated, chosen by eye from the 2026-09-19 walk: a
+# corner view, whole building in frame, least in front of it. Default <key>_1.
+#   ncb_5          ncb_1 is cropped on the left; _5 shows the NE end + long side
+#   warmemorial_2  _2 shows two facades; _1 is nearly face-on
+PRIMARY = {
+    "ncb": "ncb_5.jpg",
+    "warmemorial": "warmemorial_2.jpg",
+}
+
+
 def primary_photo(key: str) -> Path | None:
+    if key in PRIMARY and (PHOTOS / PRIMARY[key]).exists():
+        return PHOTOS / PRIMARY[key]
     for ext in (".jpg", ".jpeg", ".JPG", ".JPEG", ".png"):
         p = PHOTOS / f"{key}_1{ext}"
         if p.exists():
