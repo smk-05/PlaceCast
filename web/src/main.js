@@ -35,13 +35,23 @@ const viewer = new Cesium.Viewer('cesium', {
 // Cesium World Terrain is ALREADY ELLIPSOIDAL. This is the reason the geoid
 // correction of spec 2.3 is mostly sidestepped: no NAVD88 conversion, no PROJ
 // grid download, no building buried three storeys underground.
-try {
-  viewer.scene.setTerrain(
-    new Cesium.Terrain(Cesium.CesiumTerrainProvider.fromIonAssetId(1)),
-  );
-} catch (e) {
-  console.warn('Cesium World Terrain unavailable; using the ellipsoid.', e);
-}
+//
+// The provider loads asynchronously, and until it resolves viewer.terrainProvider
+// is the flat ellipsoid. Sampling ground before then silently returned 0 and put
+// the building ~600 m inside the hill. Everything that needs the ground awaits
+// this promise instead.
+const terrainReady = (async () => {
+  try {
+    const provider = await Cesium.CesiumTerrainProvider.fromIonAssetId(1);
+    viewer.terrainProvider = provider;
+    return provider;
+  } catch (e) {
+    console.warn('Cesium World Terrain unavailable; using the ellipsoid.', e);
+    document.getElementById('err').textContent =
+      'World Terrain failed to load (check CESIUM_ION_TOKEN) — showing the bare ellipsoid.';
+    return null;
+  }
+})();
 
 viewer.scene.globe.depthTestAgainstTerrain = true;
 
@@ -130,6 +140,8 @@ async function drawBuilding(rec) {
   const [lat, lon] = rec.enu_origin_geodetic;
   // Spec 8: sample at maximum detail and PIN it; never re-sample on camera moves.
   const ground = await sampleGround(Cesium.Cartographic.fromDegrees(lon, lat));
+  rec._ground = ground;   // flyTo aims the camera at this height
+  console.info(`ground at footprint centroid: ${ground.toFixed(1)} m (ellipsoidal)`);
   const enuToFixed = Cesium.Transforms.eastNorthUpToFixedFrame(
     Cesium.Cartesian3.fromDegrees(lon, lat, ground),
   );
@@ -180,14 +192,17 @@ async function drawBuilding(rec) {
  * the fine tile loads. Do not re-sample on camera movement.
  */
 async function sampleGround(carto) {
+  // Wait for the REAL terrain. With no terrain the globe itself is the
+  // ellipsoid, so 0 is then the correct ground — consistent, not buried.
+  const provider = await terrainReady;
+  if (!provider) return 0;
   try {
-    const provider = viewer.terrainProvider;
-    if (!provider || !provider.availability) return 0;
     const [sampled] = await Cesium.sampleTerrainMostDetailed(provider, [
       Cesium.Cartographic.clone(carto),
     ]);
-    return sampled.height || 0;
-  } catch {
+    return Number.isFinite(sampled.height) ? sampled.height : 0;
+  } catch (e) {
+    console.warn('terrain sample failed', e);
     return 0;
   }
 }
@@ -220,11 +235,22 @@ function renderPanel(rec) {
 
 const fmt = (v, n) => (typeof v === 'number' ? v.toFixed(n) : '-');
 
+/**
+ * Aim at the building rather than at a fixed altitude. The old version flew to
+ * 260 m above the ELLIPSOID — but Blacksburg's terrain is ~600 m above it, so
+ * the camera ended up ~340 m inside the hill looking at terrain from below
+ * (the spec 2.3 datum trap, applied to the camera instead of the building).
+ */
 function flyTo(rec) {
   const [lat, lon] = rec.enu_origin_geodetic;
-  viewer.camera.flyTo({
-    destination: Cesium.Cartesian3.fromDegrees(lon, lat - 0.0016, 260),
-    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-32), roll: 0 },
+  const ground = rec._ground ?? 0;
+  const target = new Cesium.BoundingSphere(
+    Cesium.Cartesian3.fromDegrees(lon, lat, ground + 10), 60,
+  );
+  viewer.camera.flyToBoundingSphere(target, {
+    offset: new Cesium.HeadingPitchRange(
+      Cesium.Math.toRadians(20), Cesium.Math.toRadians(-35), 260,
+    ),
     duration: 1.6,
   });
 }
