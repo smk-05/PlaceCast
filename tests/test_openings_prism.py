@@ -196,10 +196,15 @@ def test_roof_hit_and_miss_go_to_review_and_other_is_skipped():
 # ---------------------------------------------------------------- refinement
 
 
+# A small search grid for the tests that are not about the grid itself: yaw +-15 (default), position +-2 m in one
+# 2 m step, pitch +-2, no focal scaling, no fine stage, one process.
+NARROW = {"pos_range": 2.0, "pos_step": 2.0, "refine_step": None, "pitch_range": 2.0, "scales": (1.0,), "workers": 1}
+
+
 def test_ten_degrees_of_yaw_error_is_recovered():
     prism, true = _prism(), _camera(0, -40, 0.0)
     mask = _mask(prism, true)
-    fit = op.fit_camera(prism, mask, true.moved(yaw_deg=10.0), pos_range=2.0, pitch_range=2.0)
+    fit = op.fit_camera(prism, mask, true.moved(yaw_deg=10.0), **NARROW)
     assert fit.iou_initial < 0.9
     assert fit.yaw_offset_deg == pytest.approx(-10.0, abs=1.0)
     assert fit.camera.yaw_deg == pytest.approx(0.0, abs=1.0)
@@ -211,9 +216,40 @@ def test_refinement_places_the_opening_where_the_true_camera_would():
     mask = _mask(prism, true)
     opening = _on_south("w1", true, mask, cx=3.0, z0=3.0)
     result = op.place_openings_on_prism(prism, None, mask, [opening], camera=true.moved(yaw_deg=10.0),
-                                        fit_kwargs={"pos_range": 2.0, "pitch_range": 2.0})
+                                        fit_kwargs=NARROW)
     r, = result.openings
     assert r["decision"] == "ACCEPT" and r["hit_enu"] == pytest.approx([3.0, -5.0, 3.75], abs=0.15)
+
+
+def test_a_wrong_focal_length_is_recovered_as_a_scale():
+    prism, true = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, true)
+    # An EXIF focal 10% too long: the fit should scale it back by ~0.91, i.e. the 0.90 step. Position, yaw and
+    # pitch are pinned so nothing else can absorb the error.
+    fit = op.fit_camera(prism, mask, true.moved(scale=1.10), yaw_range=0.0, pitch_range=0.0, pos_range=0.0,
+                        workers=1)
+    assert fit.focal_scale == pytest.approx(0.90) and fit.iou > 0.95 and fit.iou_initial < 0.9
+    assert fit.camera.f_px == pytest.approx(F_PX * 1.10 * 0.90)
+    assert fit.at_edge == () and fit.reliable
+    assert fit.to_dict()["focal_scale"] == pytest.approx(0.90)
+
+
+def test_position_is_refined_to_one_metre_inside_the_coarse_step():
+    prism, true = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, true)
+    # 6 m east of the truth: the 4 m grid has -4 and -8, the 1 m stage must land on -6.
+    fit = op.fit_camera(prism, mask, true.moved(dx=6.0), yaw_range=0.0, pitch_range=0.0, scales=(1.0,), workers=1)
+    assert (fit.dx_m, fit.dy_m) == pytest.approx((-6.0, 0.0)) and fit.iou > 0.99 and fit.at_edge == ()
+
+
+def test_the_parallel_grid_gives_the_same_fit_as_the_sequential_one():
+    prism, true = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, true)
+    kw = {"yaw_range": 5.0, "pitch_range": 0.0}  # 11 x 81 x 7 = 6237 coarse candidates: over the parallel threshold
+    start = true.moved(yaw_deg=3.0, dx=2.0, scale=1.05)
+    a = op.fit_camera(prism, mask, start, workers=1, **kw)
+    b = op.fit_camera(prism, mask, start, workers=2, **kw)
+    assert a.to_dict() == b.to_dict()
 
 
 def test_a_best_value_on_the_grid_edge_sends_every_opening_to_review():
@@ -222,7 +258,7 @@ def test_a_best_value_on_the_grid_edge_sends_every_opening_to_review():
     opening = _on_south("w1", true, mask, cx=3.0, z0=3.0)
     # 6 m east of the truth but searched only +-4 m: the optimum is outside the grid.
     result = op.place_openings_on_prism(prism, None, mask, [opening], camera=true.moved(dx=6.0),
-                                        fit_kwargs={"pos_range": 4.0, "pitch_range": 1.0, "yaw_range": 2.0})
+                                        fit_kwargs={**NARROW, "pos_range": 4.0, "pitch_range": 1.0, "yaw_range": 2.0})
     assert not result.fit.reliable and "east" in result.fit.at_edge
     r, = result.openings
     assert r["decision"] == "REVIEW" and any("edge of the search grid" in why for why in r["reasons"])
@@ -251,6 +287,12 @@ def test_facade_check_compares_the_photographed_wall_with_the_front_heading():
     wrap = op.facade_check({"facade": {"front_heading_deg": 355.0}}, [{"bearing_deg": 4.0}])
     assert wrap["consistent"] and wrap["delta_deg"] == pytest.approx(9.0)
     assert op.facade_check({"facade": {"front_heading_deg": None}}, ops)["applicable"] is False
+    # A front that is only the glTF convention is not evidence: skipped even when it would "match" or "mismatch".
+    for heading in (180.0, 20.0):
+        skipped = op.facade_check({"facade": {"front_heading_deg": heading, "front_source": "gltf_prior"}}, ops)
+        assert skipped["applicable"] is False and "gltf_prior" in skipped["reason"]
+    real = op.facade_check({"facade": {"front_heading_deg": 175.0, "front_source": "photographed_side"}}, ops)
+    assert real["applicable"] and real["consistent"]
 
 
 def test_record_gets_the_openings(tmp_path):

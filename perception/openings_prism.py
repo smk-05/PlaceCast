@@ -27,9 +27,13 @@ defined on the frame DIAGONAL (43.27 mm): f_px = f35 * diag_px / 43.27.
 
 Refinement (fit_camera). The prism is projected into the image and its silhouette scored against the building mask
 by plain IoU (position and scale matter here: the camera is metric, unlike perception/render_compare's normalised
-score), over yaw +-15 deg (1 deg), east/north +-8 m (2 m), pitch +-5 deg (1 deg). A best value on the edge of any axis
-means the optimum is outside the grid, so it is not trusted. camera_iou < MIN_CAMERA_IOU or an edge value sends every
-opening from the photo to REVIEW.
+score), over yaw +-15 deg (1 deg), east/north +-16 m (4 m), pitch +-5 deg (1 deg) and a focal-length scale of
+0.85-1.15 (0.05): the EXIF focal length is a nominal value, and the fit otherwise trades a wrong focal length for a
+wrong distance. The best coarse candidate is then refined in position only, at 1 m within one coarse step. A best
+value on the edge of any axis (yaw, pitch, east, north or focal scale) means the optimum is outside the grid, so it
+is not trusted. camera_iou < MIN_CAMERA_IOU or an edge value sends every opening from the photo to REVIEW; a photo
+that still fails is REVIEW and the grid is not widened further. The coarse grid is ~193k silhouettes, scored in
+parallel worker processes (up to 8).
 
 Placement. Perspective rays from the camera through each opening's centre and four box corners hit the prism
 (trimesh extrusion of the ENU footprint); the first hit is the surface. A wall hit is mapped to the footprint edge
@@ -75,8 +79,9 @@ from perception.openings_3d import (  # noqa: E402  (the rules and the extras se
 
 CAMERA_HEIGHT_M = 1.5
 YAW_RANGE_DEG, YAW_STEP_DEG = 15.0, 1.0
-POS_RANGE_M, POS_STEP_M = 8.0, 2.0
+POS_RANGE_M, POS_STEP_M, REFINE_STEP_M = 16.0, 4.0, 1.0
 PITCH_RANGE_DEG, PITCH_STEP_DEG = 5.0, 1.0
+FOCAL_SCALES = (0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15)  # x the EXIF-derived focal length in pixels
 MIN_CAMERA_IOU = 0.6
 DOOR_MAX_BOTTOM_M = 1.0
 DOOR_TYPES = ("door", "entrance", "garage_door")
@@ -179,10 +184,11 @@ class PinholeCamera:
         z = rel @ forward
         return np.stack([self.width / 2 + self.f_px * (rel @ right) / z, self.height / 2 - self.f_px * (rel @ up) / z], axis=1)
 
-    def moved(self, yaw_deg=0.0, dx=0.0, dy=0.0, pitch_deg=0.0):
+    def moved(self, yaw_deg=0.0, dx=0.0, dy=0.0, pitch_deg=0.0, scale=1.0):
+        """A camera offset from this one; `scale` multiplies the focal length in pixels."""
         x, y, z = self.position
         return PinholeCamera((x + dx, y + dy, z), self.yaw_deg + yaw_deg, self.pitch_deg + pitch_deg,
-                             self.f_px, self.width, self.height)
+                             self.f_px * scale, self.width, self.height)
 
 
 def exif_focal_35mm(photo):
@@ -303,6 +309,7 @@ class CameraFit:
     dx_m: float
     dy_m: float
     pitch_offset_deg: float
+    focal_scale: float  # refined f_px / EXIF f_px
     at_edge: tuple  # names of the axes whose best value sits on the grid boundary
     reliable: bool
     why: tuple  # reasons the fit is not reliable
@@ -313,44 +320,99 @@ class CameraFit:
             "camera_yaw_deg": self.camera.yaw_deg % 360, "exif_heading_deg": self.initial.yaw_deg,
             "yaw_offset_deg": self.yaw_offset_deg, "camera_pitch_deg": self.camera.pitch_deg,
             "camera_position_enu": list(self.camera.position), "position_offset_m": [self.dx_m, self.dy_m],
-            "f_px": self.camera.f_px, "at_grid_edge": list(self.at_edge), "reliable": self.reliable,
-            "reasons": list(self.why),
+            "focal_scale": self.focal_scale, "f_px": self.camera.f_px, "f_px_exif": self.initial.f_px,
+            "at_grid_edge": list(self.at_edge), "reliable": self.reliable, "reasons": list(self.why),
         }
 
 
 def _offsets(half_range, step):
-    n = int(round(half_range / step))
+    n = int(round(half_range / step)) if step else 0
     return [0.0] + [s * k * step for k in range(1, n + 1) for s in (-1, 1)]
 
 
-def fit_camera(prism, mask, camera, *, refine=True, yaw_range=YAW_RANGE_DEG, pos_range=POS_RANGE_M,
-               pitch_range=PITCH_RANGE_DEG):
-    """Grid-refine the EXIF camera against the building mask. See the module docstring. Ties keep the candidate
-    nearest the EXIF camera (offsets are enumerated nearest-first and only a real improvement replaces the best)."""
+_WORKER = {}  # per-process state for the parallel grid: (rasteriser, target, camera)
+
+
+def _init_worker(prism, width, height, target, camera):
+    _WORKER["state"] = (_Rasteriser(prism, width, height), target, camera)
+
+
+def _score_chunk(candidates):
+    raster, target, camera = _WORKER["state"]
+    return [silhouette_iou(raster, camera.moved(*c), target) for c in candidates]
+
+
+def _score_all(candidates, raster, target, camera, prism, workers):
+    """IoU of every (dyaw, dx, dy, dpitch, scale) candidate, in order. Chunks go to worker processes when there
+    are enough of them to pay for the start-up; the scores do not depend on how the work was split."""
+    if workers > 1 and len(candidates) > 4000:
+        from concurrent.futures import ProcessPoolExecutor
+
+        size = math.ceil(len(candidates) / (workers * 4))
+        chunks = [candidates[i : i + size] for i in range(0, len(candidates), size)]
+        with ProcessPoolExecutor(workers, initializer=_init_worker,
+                                 initargs=(prism, camera.width, camera.height, target, camera)) as pool:
+            return [v for part in pool.map(_score_chunk, chunks) for v in part]
+    return [silhouette_iou(raster, camera.moved(*c), target) for c in candidates]
+
+
+def _first_best(candidates, scores, floor_iou):
+    """The first candidate (in enumeration order) that beats every earlier one by more than TIE_TOL, so an exact
+    tie keeps the candidate nearest the EXIF camera."""
+    best, best_iou = None, floor_iou
+    for c, s in zip(candidates, scores):
+        if s > best_iou + TIE_TOL:
+            best, best_iou = c, s
+    return best, best_iou
+
+
+def fit_camera(prism, mask, camera, *, refine=True, yaw_range=YAW_RANGE_DEG, pitch_range=PITCH_RANGE_DEG,
+               pos_range=POS_RANGE_M, pos_step=POS_STEP_M, refine_step=REFINE_STEP_M, scales=FOCAL_SCALES,
+               workers=None):
+    """Grid-refine the EXIF camera against the building mask. See the module docstring.
+
+    Coarse grid over yaw x pitch x (east, north) x focal scale; then position only, at `refine_step`, within one
+    coarse step of the best (never past `pos_range`, so an optimum outside the grid still reads as an edge hit).
+    Ties keep the candidate nearest the EXIF camera: candidates are enumerated nearest-first and only a real
+    improvement replaces the best. `workers`: processes for the coarse grid (default: up to 8 cores)."""
+    import os
+
     full = _mask_array(mask)
     raster = _Rasteriser(prism, camera.width, camera.height)
     target = cv2.resize(full.astype(np.float32), (raster.size[1], raster.size[0]), interpolation=cv2.INTER_AREA) >= 0.5
     iou0 = silhouette_iou(raster, camera, target)
     if not refine:
-        return CameraFit(camera, camera, iou0, iou0, 0.0, 0.0, 0.0, 0.0, (), *_reliability(iou0, ()))
+        return CameraFit(camera, camera, iou0, iou0, 0.0, 0.0, 0.0, 0.0, 1.0, (), *_reliability(iou0, ()))
+    workers = max(1, min(os.cpu_count() or 1, 8)) if workers is None else workers
 
-    yaws, poss, pitches = (_offsets(yaw_range, YAW_STEP_DEG), _offsets(pos_range, POS_STEP_M),
-                           _offsets(pitch_range, PITCH_STEP_DEG))
-    best, best_iou = (0.0, 0.0, 0.0, 0.0), iou0
-    for dyaw in yaws:
-        for dpitch in pitches:
-            for dx in poss:
-                for dy in poss:
-                    if not (dyaw or dpitch or dx or dy):
-                        continue
-                    iou = silhouette_iou(raster, camera.moved(dyaw, dx, dy, dpitch), target)
-                    if iou > best_iou + TIE_TOL:
-                        best, best_iou = (dyaw, dx, dy, dpitch), iou
-    dyaw, dx, dy, dpitch = best
-    edge = tuple(name for name, v, r in (("yaw", dyaw, yaw_range), ("east", dx, pos_range), ("north", dy, pos_range),
-                                        ("pitch", dpitch, pitch_range)) if abs(v) >= r - 1e-9)
-    return CameraFit(camera.moved(dyaw, dx, dy, dpitch), camera, best_iou, iou0, dyaw, dx, dy, dpitch, edge,
-                     *_reliability(best_iou, edge))
+    scales = tuple(sorted(scales, key=lambda s: abs(s - 1.0)))  # nearest 1.0 first
+    poss = _offsets(pos_range, pos_step)
+    # Candidates are (dyaw, dx, dy, dpitch, scale): the argument order of PinholeCamera.moved.
+    coarse = [(dyaw, dx, dy, dpitch, s)
+              for dyaw in _offsets(yaw_range, YAW_STEP_DEG) for dpitch in _offsets(pitch_range, PITCH_STEP_DEG)
+              for dx in poss for dy in poss for s in scales]
+    coarse.sort(key=lambda c: abs(c[0]) / (yaw_range or 1) + math.hypot(c[1], c[2]) / (pos_range or 1)
+                + abs(c[3]) / (pitch_range or 1) + abs(c[4] - 1.0))  # stable: ties keep grid order
+    best, best_iou = _first_best(coarse, _score_all(coarse, raster, target, camera, prism, workers), iou0)
+    best = best or (0.0, 0.0, 0.0, 0.0, 1.0)
+
+    if refine_step and refine_step < pos_step:
+        radius = pos_step - refine_step
+        fine = [(best[0], best[1] + a, best[2] + b, best[3], best[4])
+                for a in _offsets(radius, refine_step) for b in _offsets(radius, refine_step)
+                if abs(best[1] + a) <= pos_range + 1e-9 and abs(best[2] + b) <= pos_range + 1e-9]
+        found, found_iou = _first_best(fine, [silhouette_iou(raster, camera.moved(*c), target) for c in fine],
+                                       best_iou)
+        best, best_iou = found or best, found_iou
+
+    dyaw, dx, dy, dpitch, scale = best
+    axes = [("yaw", dyaw, yaw_range), ("pitch", dpitch, pitch_range), ("east", dx, pos_range),
+            ("north", dy, pos_range)]
+    edge = [name for name, v, r in axes if r > 0 and abs(v) >= r - 1e-9]
+    if len(scales) > 1 and (scale <= min(scales) + 1e-9 or scale >= max(scales) - 1e-9):
+        edge.append("focal scale")
+    return CameraFit(camera.moved(dyaw, dx, dy, dpitch, scale), camera, best_iou, iou0, dyaw, dx, dy, dpitch, scale,
+                     tuple(edge), *_reliability(best_iou, edge))
 
 
 def _reliability(iou, edge):
@@ -481,9 +543,13 @@ def _bearing_gap(a, b):
 def facade_check(record, openings):
     """Do the openings' wall bearings agree with record['facade']['front_heading_deg'] (within 10 deg)?
 
-    Applies only when the record has a front heading: a prism record has none (no mesh, so no front), and a made-up
-    default would be worse than no check."""
-    front = ((record or {}).get("facade") or {}).get("front_heading_deg")
+    Applies only when the record has a front heading that is EVIDENCE: a prism record has none (no mesh, so no
+    front), and a front_source of "gltf_prior" is the glTF +Z convention, so agreeing or disagreeing with it means
+    nothing. A made-up default would be worse than no check."""
+    facade = (record or {}).get("facade") or {}
+    if facade.get("front_source") == "gltf_prior":  # the glTF +Z convention, not evidence: a mismatch means nothing
+        return {"applicable": False, "reason": "front_source is gltf_prior: the front is a convention, not evidence"}
+    front = facade.get("front_heading_deg")
     if front is None:
         return {"applicable": False, "reason": "record has no facade.front_heading_deg (prism: no mesh, no front)"}
     bearings = [op["bearing_deg"] for op in openings if op["bearing_deg"] is not None]
@@ -567,7 +633,7 @@ def main():
     print(f"camera_iou={fit.iou:.3f} (EXIF camera {fit.iou_initial:.3f}); yaw {fit.camera.yaw_deg % 360:.1f} vs EXIF "
           f"{fit.initial.yaw_deg:.1f} (offset {fit.yaw_offset_deg:+.0f}); position offset "
           f"({fit.dx_m:+.0f}, {fit.dy_m:+.0f}) m; pitch offset {fit.pitch_offset_deg:+.0f}; "
-          f"edge={list(fit.at_edge)} reliable={fit.reliable}")
+          f"focal scale {fit.focal_scale:.2f}; edge={list(fit.at_edge)} reliable={fit.reliable}")
     for wall, (bearing, ids) in sorted(result.per_wall().items()):
         print(f"  wall {wall}: bearing {bearing:.1f}  {len(ids)} openings")
     print("facade check:", result.facade_check)
