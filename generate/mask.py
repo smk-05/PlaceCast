@@ -90,3 +90,57 @@ def mask_photo(photo_path: Path, mask: np.ndarray, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
     return out_path
+
+
+# --------------------------------------------------------------------------
+# After the edit: FLUX may invent a background around a masked building
+# --------------------------------------------------------------------------
+
+BORDER_FRAC = 0.04        # outer band of the image checked for background
+WHITE_MIN = 235           # a channel value this high counts as "white"
+BORDER_WHITE_OK = 0.85    # below this share of white border, FLUX added a scene
+CLOSE_FRAC = 0.03         # closing radius (of the side) that bridges mask notches
+REGROW_FRAC = 0.012       # slack for FLUX shifting edges by a few pixels
+
+
+def border_white_fraction(img: np.ndarray) -> float:
+    h, w = img.shape[:2]
+    b = max(1, int(round(BORDER_FRAC * min(h, w))))
+    band = np.concatenate([img[:b].reshape(-1, 3), img[-b:].reshape(-1, 3),
+                           img[:, :b].reshape(-1, 3), img[:, -b:].reshape(-1, 3)])
+    return float((band.min(axis=1) >= WHITE_MIN).mean())
+
+
+def enforce_background(edited_path: Path, masked_input_path: Path,
+                       out_path: Path) -> tuple[Path, float]:
+    """If the edit invented a background, cut the building back out.
+
+    -> (image to lift, white share of the edited image's border). Returns
+    `edited_path` untouched when the border is already white. Otherwise the
+    building region is taken from the MASKED INPUT (its non-white pixels —
+    Kontext keeps the layout), closed so notches left by occluders are
+    bridged, grown slightly, and everything outside it is painted white.
+    """
+    import cv2
+
+    with Image.open(edited_path) as im:
+        edited = np.asarray(im.convert("RGB")).copy()
+    frac = border_white_fraction(edited)
+    if frac >= BORDER_WHITE_OK:
+        return Path(edited_path), frac
+
+    with Image.open(masked_input_path) as im:
+        src = im.convert("RGB").resize((edited.shape[1], edited.shape[0]),
+                                       Image.BILINEAR)
+    building = np.asarray(src).min(axis=2) < WHITE_MIN
+    side = min(building.shape)
+    rc = max(1, int(round(CLOSE_FRAC * side)))
+    rg = max(1, int(round(REGROW_FRAC * side)))
+    k = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    m = cv2.morphologyEx(building.astype(np.uint8), cv2.MORPH_CLOSE, k(rc))
+    m = ndimage.binary_fill_holes(m > 0)
+    m = cv2.dilate(m.astype(np.uint8), k(rg)) > 0
+
+    edited[~m] = BACKGROUND
+    Image.fromarray(edited).save(out_path)
+    return Path(out_path), frac

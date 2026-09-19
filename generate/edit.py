@@ -41,7 +41,12 @@ SILHOUETTE_MUTATING = re.compile(
 
 SAFE_SUFFIX = (
     "Preserve the building's exact silhouette, roofline, footprint and "
-    "proportions. Change only surface materials and weathering."
+    "proportions. Change only surface materials and weathering. "
+    # A masked input is a building on plain white. Without this, Kontext
+    # sometimes paints in sky and a dirt yard (NCB from ncb_6, 2026-09-19),
+    # and TRELLIS then lifts the yard as a 100 m slab of geometry.
+    "Keep the plain white background exactly as it is: do not add sky, "
+    "ground, vegetation or any surroundings."
 )
 
 

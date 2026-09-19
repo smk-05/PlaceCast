@@ -421,7 +421,7 @@ def _facade_entry(fp, mo, chosen, result, front_source, log) -> dict:
     }
 
 
-def _generation_input(photo, photo_ev, run_dir, log, *, use_mask):
+def _generation_input(photo, photo_ev, run_dir, log, *, use_mask, index=0):
     """-> (image FLUX/TRELLIS should see, provenance dict or None). Plan 3.1.
 
     The primary photo is cut out with its segmentation mask when that mask is
@@ -441,8 +441,8 @@ def _generation_input(photo, photo_ev, run_dir, log, *, use_mask):
             "generating from the raw photo — scenery in front may become geometry")
         return Path(photo), None
 
-    out = run_dir / "masked_0.png"
-    if not out.exists() and (run_dir / "edited_0.png").exists():
+    out = run_dir / f"masked_{index}.png"
+    if not out.exists() and (run_dir / f"edited_{index}.png").exists():
         # An --asset-id re-run of a run generated WITHOUT a mask: its cached
         # edit and mesh came from the raw photo. Keep the provenance true.
         log("mask: not applied — this run's cached edit/mesh were generated "
@@ -464,23 +464,47 @@ def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=Tru
     from generate.edit import edit_image
     from generate.lift import lift_to_mesh, load_vertices
 
-    # Only the primary photo has a mask (segmentation runs once, at ingest).
-    first, mask_model = _generation_input(photos[0], photo_ev, run_dir, log,
-                                          use_mask=use_mask)
-    inputs = [first, *[Path(p) for p in photos[1:]]]
+    from generate.mask import enforce_background
 
+    # Every view is masked the same way (multi-view, spec 5.2): one unmasked
+    # view reintroduces the scenery the others removed. The primary's mask came
+    # from ingest; the others are fetched from the same (cached) segmentation.
+    inputs, mask_models = [], []
+    for i, p in enumerate(photos):
+        ev = photo_ev
+        if i > 0 and photo_ev is not None and                 photo_ev.segmentation_model.startswith("real:") and use_mask:
+            from perception.segment import clean, segment_building_evidence
+            m, _, _, seg = segment_building_evidence(Path(p), backend="real")
+            ev = _replace(photo_ev, mask=clean(m),
+                          segmentation_model=seg["segmentation_model"])
+        img, prov = _generation_input(p, ev, run_dir, log, use_mask=use_mask, index=i)
+        inputs.append(img)
+        mask_models.append(prov)
+
+    # Spec 5.1: views must be edited with a SHARED seed and prompt, or they
+    # disagree and TRELLIS averages them into mush.
     edited = []
     for i, p in enumerate(inputs):
         out = run_dir / f"edited_{i}.png"
         log(f"edit: {p.name} -> {out.name}")
-        edited.append(edit_image(Path(p), prompt, out, seed=seed))
+        e = edit_image(Path(p), prompt, out, seed=seed)
+        if mask_models[i]:
+            # The input was a building on white; if the edit painted a scene
+            # in, cut it back out, or TRELLIS lifts the scene as geometry.
+            clean_e, white = enforce_background(e, p, run_dir / f"edited_clean_{i}.png")
+            if clean_e != e:
+                log(f"edit: FLUX added a background to view {i} (border "
+                    f"{white:.0%} white); re-masked -> {clean_e.name}")
+                mask_models[i] = {**mask_models[i], "post_edit_remask": clean_e.name}
+                e = clean_e
+        edited.append(e)
 
     glb = run_dir / "mesh.glb"
-    log("lift: TRELLIS (10-60 s)")
+    log(f"lift: TRELLIS from {len(edited)} view(s) (10-60 s)")
     glb, params = lift_to_mesh(edited, glb, seed=seed)
 
     models = [
-        *([mask_model] if mask_model else []),
+        *[m for m in mask_models if m],
         {"stage": "edit", "name": "flux-kontext-pro", "seed": seed},
         {"stage": "lift", "name": "trellis", "seed": seed, "params": params},
     ]
