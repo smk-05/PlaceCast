@@ -32,8 +32,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 
-from contracts import Decision, PlacementRecord
+# Tokens (REPLICATE_API_TOKEN, CESIUM_ION_TOKEN, ...) live in .env, which is
+# gitignored. Without this they are silently absent and generation fails.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from contracts import Decision, PlacementRecord  # noqa: E402
 from geo import disambiguate, exif, fit as fitmod, height as heightmod, outline, validate
 from geo.coords import ENUFrame
 from geo.footprint import build_footprint, fetch_osm, geocode, select_footprint, to_shapely

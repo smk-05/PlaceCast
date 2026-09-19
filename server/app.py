@@ -24,6 +24,10 @@ from pydantic import BaseModel
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "data" / "runs"
 
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(ROOT / ".env")
+
 app = FastAPI(title="Procedura placement API")
 app.add_middleware(
     CORSMiddleware,
