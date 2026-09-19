@@ -68,6 +68,55 @@ def test_front_is_unknown_for_z_up_meshes(idx):
 
 
 # --------------------------------------------------------------------------
+# choose_up_axis — the glTF prior vs the prismatic score
+# --------------------------------------------------------------------------
+
+
+def _box_cloud(ext, n=6000, seed=0, base_axis=1, base_at_min=True):
+    """Surface-ish point cloud of a box with a dense ground slab on base_axis."""
+    rng = np.random.default_rng(seed)
+    pts = rng.uniform(-0.5, 0.5, size=(n, 3)) * np.asarray(ext)
+    slab = rng.uniform(-0.5, 0.5, size=(n // 3, 3)) * np.asarray(ext)
+    lo = -0.5 * ext[base_axis]
+    slab[:, base_axis] = lo + rng.uniform(0, 0.05, n // 3) * ext[base_axis]
+    if not base_at_min:
+        slab[:, base_axis] *= -1
+    return np.vstack([pts, slab])
+
+
+def test_boxy_mesh_keeps_the_gltf_y_up_prior():
+    """The NCB failure: a box is prismatic along every axis, so the prismatic
+    score is a near-tie and must not override glTF's +Y."""
+    v = _box_cloud([0.74, 0.36, 1.0])   # the real NCB mesh's extents
+    idx, reason = outline.choose_up_axis(v)
+    assert idx == GLTF_UP, reason
+
+
+def test_upside_down_mesh_gets_minus_y():
+    """The prismatic score is sign-blind; vertex mass sets the sign."""
+    v = _box_cloud([0.74, 0.36, 1.0], base_at_min=False)
+    idx, _ = outline.choose_up_axis(v)
+    assert idx == 3   # -Y
+
+
+def test_clear_prismatic_evidence_overrides_the_prior():
+    """A triangular prism extruded along Z: cross-sections vary strongly along Y
+    and not at all along Z, so Z should win by a wide margin."""
+    rng = np.random.default_rng(5)
+    n = 8000
+    x = rng.uniform(-1, 1, n)
+    y = rng.uniform(0, 1, n)
+    keep = np.abs(x) <= (1 - y)          # triangle in the XY plane
+    z = rng.uniform(0, 3, n)
+    z[: n // 4] = rng.uniform(0, 0.1, n // 4)   # dense base at min Z
+    v = np.column_stack([x, y, z])[keep]
+
+    idx, reason = outline.choose_up_axis(v)
+    assert idx in (4, 5), reason
+    assert "override" in reason
+
+
+# --------------------------------------------------------------------------
 # facade_heading
 # --------------------------------------------------------------------------
 

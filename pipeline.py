@@ -102,8 +102,10 @@ def run(address: str,
 
     # -- 6.1-6.4 canonicalise -----------------------------------------------
     if mesh_vertices is not None:
+        up_idx, up_reason = outline.choose_up_axis(np.asarray(mesh_vertices, dtype=float))
+        log(f"up-axis: {up_reason}")
         mo = outline.build_mesh_outline(
-            mesh_vertices, footprint_aspect=fp.ombb.aspect
+            mesh_vertices, up_axis_idx=up_idx, footprint_aspect=fp.ombb.aspect
         )
         log(f"outline: {len(mo.pts_enu)} verts, up_axis={mo.up_axis_idx}, "
             f"extent_ratio={mo.extent_ratio:.3f}")
@@ -334,7 +336,9 @@ def _fail_record(asset_id, address, g, element, fp, frame, reason, run_dir):
 
 class _Logger:
     def __init__(self, path: Path):
-        self.f = open(path, "w", encoding="utf-8")
+        # Append: a re-run with --asset-id keeps the earlier run's log above it.
+        self.f = open(path, "a", encoding="utf-8")
+        self.f.write(f"\n===== run {datetime.now(timezone.utc).isoformat()} =====\n")
 
     def __call__(self, msg: str) -> None:
         print(msg)
@@ -360,13 +364,17 @@ def main(argv=None) -> int:
     ap.add_argument("--anisotropy", action="store_true",
                     help="allow limited non-uniform scaling (spec 6.9)")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--asset-id", default=None,
+                    help="re-use an existing run directory: its cached edit and "
+                         "mesh are used, so no model is re-run and nothing is billed")
     args = ap.parse_args(argv)
 
     try:
         rec = run(args.address, photos=list(args.photo), prompt=args.prompt,
                   dry_run=args.dry_run, perception=args.perception,
                   confidence_method=args.confidence,
-                  allow_anisotropy=args.anisotropy, seed=args.seed)
+                  allow_anisotropy=args.anisotropy, seed=args.seed,
+                  asset_id=args.asset_id)
     except (LookupError, RuntimeError, ValueError) as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         return 1

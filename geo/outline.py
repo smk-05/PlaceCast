@@ -87,6 +87,50 @@ def prismatic_score(vertices: np.ndarray, axis: np.ndarray, k: int = 20) -> floa
     return -float(a.std() / mean)
 
 
+GLTF_UP_IDX = 2          # +Y, the glTF 2.0 convention (spec 6.1, 13.1)
+UP_OVERRIDE_MARGIN = 0.15
+
+
+def choose_up_axis(vertices: np.ndarray) -> tuple[int, str]:
+    """-> (up_axis_idx, reason). glTF +Y is the PRIOR; prismatic score must beat
+    it clearly to override.
+
+    Why not just take the best prismatic score (spec 6.1(a))? Because a box has
+    a near-constant cross-section along ALL THREE axes, so for boxy buildings —
+    most buildings — the score is a near-tie and the argmax is noise. Observed
+    on the first real TRELLIS mesh (NCB): +Z scored -0.3625, +Y -0.3882, and
+    +Z was wrong; Y was the shortest extent and held 21% of vertices in its
+    bottom tenth vs 4% in its top. Spec 6.1 itself says generators mostly
+    respect glTF's +Y up, so that is the default.
+
+    The score is also sign-blind (+Y and -Y score identically), so the sign is
+    set separately: the base is the end with more vertex mass — ground-floor
+    detail, plinths and any ground plane concentrate there, the roof is sparse.
+    """
+    scores = np.array([prismatic_score(vertices, ax) for ax in UP_AXIS_CANDIDATES])
+    best = int(np.argmax(scores))
+    gltf_score = scores[GLTF_UP_IDX]
+
+    if best // 2 == GLTF_UP_IDX // 2 or scores[best] - gltf_score < UP_OVERRIDE_MARGIN:
+        axis_pair = GLTF_UP_IDX // 2
+        reason = (f"glTF +Y prior kept (best prismatic {scores[best]:.3f} vs "
+                  f"+Y {gltf_score:.3f}; override needs +{UP_OVERRIDE_MARGIN})")
+    else:
+        axis_pair = best // 2
+        reason = (f"prismatic override: axis {axis_pair} beats +Y by "
+                  f"{scores[best] - gltf_score:.3f}")
+
+    t = vertices[:, axis_pair]
+    lo, hi = float(t.min()), float(t.max())
+    if hi - lo < 1e-12:
+        return axis_pair * 2, reason
+    u = (t - lo) / (hi - lo)
+    bottom, top = float(np.mean(u < 0.1)), float(np.mean(u > 0.9))
+    # base at the min end -> the positive axis points up
+    idx = axis_pair * 2 if bottom >= top else axis_pair * 2 + 1
+    return idx, reason + f"; sign from mass (bottom {bottom:.2f} / top {top:.2f})"
+
+
 def rank_up_axes(vertices: np.ndarray, top_n: int = 3) -> list[int]:
     """-> indices into UP_AXIS_CANDIDATES, best first.
 
@@ -204,10 +248,11 @@ def bas_relief_check(vertices_canonical: np.ndarray,
 def ground_outline(vertices_canonical: np.ndarray,
                    faces: np.ndarray | None = None,
                    *,
-                   slab_frac: float = 0.15,
-                   pixel_m: float = 0.10,
-                   close_px: int = 3,
-                   simplify_eps: float = 0.25) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+                   band: tuple[float, float] = (0.03, 0.50),
+                   grid_cells: int = 300,
+                   close_frac: float = 0.02,
+                   open_frac: float = 0.025,
+                   simplify_frac: float = 0.004) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
     """Orthographic rasterisation into an occupancy grid. Spec 6.3 (recommended).
 
     -> (outer ring, interior rings) in model units.
@@ -216,37 +261,59 @@ def ground_outline(vertices_canonical: np.ndarray,
     dense convex point sets well but degrades on exactly our cases: non-uniform
     density, and the concave corners of L-shaped and courtyard buildings.
 
-    Spec 10.1 resolution 2 — fit the base only. We take the lowest `slab_frac`
-    of the mesh, which is the part most likely to preserve the original plan
-    even when the generative edit has mutated the upper storeys.
+    EVERY length here is a fraction of the mesh's own size. This runs BEFORE
+    scaling, on a mesh ~1 model unit across. An earlier version took its grid
+    cell (0.10) and simplification tolerance (0.25) in metres, which on the
+    first real TRELLIS mesh meant a ~10-cell grid and a simplifier that erased
+    the stepped NCB plan down to a 4-corner box.
+
+    Height band, not the bottom slab. Spec 10.1 resolution 2 says fit the base,
+    and the base is still what we read — but not the very bottom: TRELLIS
+    reconstructs the scenery in the photo (lawn patches, bushes, lamp posts,
+    passers-by) as geometry at ground level, outside the walls. Starting the
+    band at 3% of height clears a ground sheet; the morphological opening then
+    severs thin attachments (posts, poles) so that keeping the largest component
+    discards them.
     """
     z = vertices_canonical[:, 2]
     height = float(z.max()) if z.size else 1.0
-    slab = vertices_canonical[z <= height * slab_frac]
-    if len(slab) < 8:
-        slab = vertices_canonical
+    m = (z >= height * band[0]) & (z <= height * band[1])
+    slab = vertices_canonical[m] if m.sum() >= 50 else vertices_canonical
 
     xy = slab[:, :2]
-    lo = xy.min(axis=0) - pixel_m * 4
-    hi = xy.max(axis=0) + pixel_m * 4
-    dims = np.maximum(((hi - lo) / pixel_m).astype(int) + 1, 4)
+    # Robust size: ignore the extreme 1% so one stray vertex cannot set the scale.
+    size = float(max(np.ptp(np.percentile(xy, [1, 99], axis=0), axis=0).max(), 1e-9))
+    pixel = size / grid_cells
+    close_px = max(3, int(round(close_frac * grid_cells)))
+    open_px = max(3, int(round(open_frac * grid_cells)))
+    simplify_eps = simplify_frac * size
+
+    pad = pixel * (close_px + open_px + 4)
+    lo = xy.min(axis=0) - pad
+    hi = xy.max(axis=0) + pad
+    dims = np.maximum(((hi - lo) / pixel).astype(int) + 1, 4)
 
     grid = np.zeros((dims[1], dims[0]), dtype=bool)
-    idx = ((xy - lo) / pixel_m).astype(int)
+    idx = ((xy - lo) / pixel).astype(int)
     grid[np.clip(idx[:, 1], 0, dims[1] - 1), np.clip(idx[:, 0], 0, dims[0] - 1)] = True
 
-    # Seal the gaps between sampled vertices, then fill the interior so the
+    # Seal the gaps between sampled wall vertices, then fill the interior so the
     # outer contour is a real boundary rather than a band of surface points.
-    grid = ndimage.binary_closing(grid, structure=np.ones((close_px, close_px)))
-    grid = ndimage.binary_dilation(grid, iterations=1)
+    disk = lambda r: (lambda yy, xx: xx * xx + yy * yy <= r * r)(*np.ogrid[-r:r + 1, -r:r + 1])  # noqa: E731
+    grid = ndimage.binary_closing(grid, structure=disk(close_px // 2 + 1))
     filled = ndimage.binary_fill_holes(grid)
 
-    # Keep the largest connected component — drops the disconnected fragments
-    # generated meshes produce.
+    # Opening severs thin appendages — lamp posts, poles, a bush touching a wall
+    # — so the largest-component step below can drop them.
+    opened = ndimage.binary_opening(filled, structure=disk(open_px // 2 + 1))
+    if opened.sum() > 0.5 * filled.sum():
+        filled = opened
+
     labels, n = ndimage.label(filled)
     if n > 1:
         sizes = ndimage.sum(filled, labels, range(1, n + 1))
         filled = labels == (int(np.argmax(sizes)) + 1)
+    pixel_m = pixel  # model units per cell; name kept for to_model below
 
     padded = np.pad(filled.astype(float), 1)
     contours = measure.find_contours(padded, 0.5)
@@ -265,9 +332,10 @@ def ground_outline(vertices_canonical: np.ndarray,
                    reverse=True)
 
     outer = simplify_ring(rings[0], simplify_eps)
-    # Interior rings = courtyards. Anything under 2 m^2 is rasterisation noise.
+    # Interior rings = courtyards. Anything under 0.1% of the plan is noise.
+    min_hole = 1e-3 * size * size
     holes = tuple(simplify_ring(r, simplify_eps) for r in rings[1:]
-                  if len(r) > 3 and Polygon(r).area > 2.0)
+                  if len(r) > 3 and Polygon(r).area > min_hole)
     return outer, holes
 
 
@@ -277,7 +345,7 @@ def build_mesh_outline(vertices: np.ndarray,
                        footprint_aspect: float = 1.0) -> MeshOutline:
     """Full 6.1 -> 6.4 chain. -> MeshOutline, ready for the solve."""
     if up_axis_idx is None:
-        up_axis_idx = rank_up_axes(vertices, top_n=1)[0]
+        up_axis_idx, _ = choose_up_axis(np.asarray(vertices, dtype=float))
 
     canon, height_units = canonicalise(np.asarray(vertices, dtype=float), up_axis_idx)
     is_relief, ratio = bas_relief_check(canon)
