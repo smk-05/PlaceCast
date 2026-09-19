@@ -6,10 +6,13 @@ reliability diagram. No calibration layer.
                                [--accept-precision 0.95] [--reject-precision 0.95]
 
 Rows are anything exposing .fit .photo .footprint (the contracts.py objects) and .label (1 = a human
-would accept the placement). Only the synthetic source
-(fixtures/fake_fits.py) exists until the solver produces real benchmark runs (F.4); swapping the
-source is a change to load_rows() alone. A model trained on the fake source is flagged
-`trained_on_synthetic` in model.json and must never be shipped.
+would accept the placement). Two sources: "fake" (fixtures/fake_fits.py, demonstrates the pipeline only) and
+"benchmark" (the spec 11 benchmark: synthetic corruptions of real footprints, scored against known truth;
+scripts/run_benchmark.py). A model trained on the fake source is flagged `trained_on_synthetic` in model.json
+and must never be shipped.
+
+`--source benchmark` does not run the row-level leave-one-out below: the benchmark has 84 correlated rows per
+building, so that would leak. It runs leave-one-building-out (confidence/benchmark_eval.py) and reports it.
 
 Method (B.3)
   * standardised features -> LogisticRegression, L2 (scikit-learn's default penalty; passing
@@ -60,6 +63,8 @@ ACCEPT_PRECISION = 0.95
 REJECT_PRECISION = 0.95
 MIN_SUPPORT = 5  # a threshold must select at least this many rows to count
 DEFAULT_OUT_DIR = ROOT / "outputs" / "confidence"
+BENCHMARK_PKL = ROOT / "outputs" / "benchmark" / "labelled_fits.pkl"
+BENCHMARK_REPS = 3  # 7 corruptions x 4 solver configs x 3 poses = 84 correlated rows per building
 
 
 # ----------------------------------------------------------------------- data
@@ -70,7 +75,18 @@ def load_rows(source, seed=0):
         from fixtures.fake_fits import generate_labelled
 
         return generate_labelled(seed=seed)
-    raise ValueError(f"unknown source {source!r}: only 'fake' exists until real benchmark runs land (F.4)")
+    if source == "benchmark":
+        # outputs/benchmark/labelled_fits.pkl is what scripts/run_benchmark.py writes (seed 0); anything else, or
+        # no file, rebuilds the rows. Delete the pickle after changing the solver: it holds the solver's old answers.
+        if seed == 0 and BENCHMARK_PKL.is_file():
+            import pickle
+
+            with open(BENCHMARK_PKL, "rb") as f:
+                return pickle.load(f)
+        from scripts.run_benchmark import benchmark_labelled_rows
+
+        return benchmark_labelled_rows(seed=seed, reps=BENCHMARK_REPS)
+    raise ValueError(f"unknown source {source!r}: use 'fake' or 'benchmark'")
 
 
 def choose_features(n_rows):
@@ -432,18 +448,27 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--source", default="fake")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument("--out-dir", default=None,
+                        help=f"default {DEFAULT_OUT_DIR}, or {DEFAULT_OUT_DIR / 'benchmark'} for --source benchmark")
     parser.add_argument("--accept-precision", type=float, default=ACCEPT_PRECISION)
     parser.add_argument("--reject-precision", type=float, default=REJECT_PRECISION)
     args = parser.parse_args(argv)
     try:
         rows = load_rows(args.source, args.seed)
+        if args.source == "benchmark":
+            from confidence import benchmark_eval
+
+            report = benchmark_eval.evaluate(rows, args.seed, args.accept_precision, args.reject_precision)
+            print(benchmark_eval.format_report(report))
+            out = benchmark_eval.write_artifacts(report, args.out_dir or DEFAULT_OUT_DIR / "benchmark")
+            print(f"\nartifacts: {out}")
+            return 0
         result = train(rows, args.seed, args.accept_precision, args.reject_precision)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(format_report(result, args.source))
-    out = write_artifacts(result, args.out_dir, args.source, args.seed)
+    out = write_artifacts(result, args.out_dir or DEFAULT_OUT_DIR, args.source, args.seed)
     print(f"\nartifacts: {out}")
     return 0
 

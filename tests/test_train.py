@@ -183,12 +183,12 @@ class GuardTests(unittest.TestCase):
             train.check_labels(np.array([0, 1, 2] * 5))
         train.check_labels(np.array([0] * 3 + [1] * 3))
 
-    def test_only_the_fake_source_exists_and_the_cli_says_so(self):
-        with self.assertRaisesRegex(ValueError, "only 'fake'"):
-            train.load_rows("benchmark")
+    def test_an_unknown_source_is_rejected_and_the_cli_says_so(self):
+        with self.assertRaisesRegex(ValueError, "unknown source"):
+            train.load_rows("real")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertEqual(train.main(["--source", "benchmark"]), 1)
+            self.assertEqual(train.main(["--source", "real"]), 1)
         self.assertIn("error:", err.getvalue())
 
 
