@@ -233,16 +233,20 @@ def _build_photo_evidence(photos, perception, run_dir, log):
     log(f"exif: heading={meta['heading_deg']} pitch={meta['pitch_deg']} "
         f"gps={meta['gps']} focal={meta['focal_mm']}")
 
-    if perception == "real":
-        from perception.segment import assess_mask, clean, segment_building
-        mask, _, _ = segment_building(primary)
-        mask = clean(mask)
-    else:
-        from perception.segment import assess_mask, clean, segment_building
-        mask, _, _ = segment_building(primary)
-        mask = clean(mask)
+    from perception.segment import assess_mask, clean, segment_building_evidence
 
-    frac, occluded, note = assess_mask(mask)
+    # Pass --perception through explicitly. perception/backend.py defaults to the
+    # REAL models (torch + GPU) when the caller says nothing, so omitting this
+    # made every photo run try to load Grounding DINO + SAM 2, even with the
+    # default --perception stub.
+    mask, _, seg_occluded, seg = segment_building_evidence(primary, backend=perception)
+    mask = clean(mask)
+    log(f"segmentation: {seg['segmentation_model']} (backend that ran: {seg['backend']})")
+
+    frac, mask_occluded, note = assess_mask(mask)
+    # Keep perception's own occlusion verdict: it knows how much of SAM's mask
+    # clean-up discarded, which the finished mask alone cannot show.
+    occluded = bool(seg_occluded or mask_occluded)
     if note:
         log(f"  mask: {note}")
 
@@ -258,7 +262,7 @@ def _build_photo_evidence(photos, perception, run_dir, log):
         exif_pitch_deg=meta["pitch_deg"],
         exif_focal_mm=meta["focal_mm"],
         exif_gps=meta["gps"],
-        segmentation_model=f"{perception}:central-box",
+        segmentation_model=seg["segmentation_model"],
     )
 
 

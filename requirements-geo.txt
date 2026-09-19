@@ -17,6 +17,8 @@ replicate>=0.32                 # section 5 generation
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pytest>=8.2
+scikit-learn>=1.5               # confidence/train.py — the gate is trained on this
+                                # machine from the benchmark run, and its tests run here
 
 # Deliberately NOT here:
 #   pyrender / any OpenGL — offscreen GL on Windows has no OSMesa and no EGL.
