@@ -34,13 +34,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import pickle
+import shutil
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -295,6 +296,7 @@ def _cluster_count(vals, tol):
 
 def edge_features(gray, mask, box):
     """Frame strength, mullion lines and interior contrast of one opening (OpenCV, on the aligned photo)."""
+    import cv2
     H, W = gray.shape
     x0, y0, x1, y1 = box
     bw, bh = x1 - x0, y1 - y0
@@ -443,6 +445,7 @@ def _run_tiles(detector, arr, tiles, crop, size, memo, source, max_tile_area_fra
 def template_fill(detector, arr, gray, mask, openings, existing, memo):
     """Propose windows the DINO passes missed: NCC of the ACCEPT windows against horizontal bands around their
     rows, then a DINO re-check on a TEMPLATE_CONTEXT crop of each peak. -> raw dets tagged source 'template'."""
+    import cv2
     H, W = gray.shape
     wins = [o for o in openings if o["type"] == "window" and o["decision"] == "ACCEPT"]
     if not wins:
@@ -683,6 +686,93 @@ def memo_path(photo, model_id):
     return seg.CACHE_DIR.parent / "openings" / f"{seg.image_sha256(photo)[:16]}_{tag}.pkl"
 
 
+# --------------------------------------------------------------------- result cache
+# Final results are cached like masks: .cache/perception/openings/<sha16>_<config_fingerprint>.json. A cache hit
+# needs neither torch nor OpenCV nor a model (a laptop without them can load what another machine computed);
+# only computing does. The pickled DINO outputs in the same directory are a separate, larger, machine-local cache.
+OPENINGS_CACHE_DIR = seg.CACHE_DIR.parent / "openings"
+CACHE_SCHEMA = 2
+_LOGIC = ("priors", "edge_features", "edge_factors", "classify", "apply_containment", "template_fill", "nms")
+
+
+def config_fingerprint(model_id=None, fine=True, template=True):
+    """Everything a result depends on: the image is keyed separately, this is the rest. Covers the model, both
+    prompts, every tuning constant, the mask settings (the mask defines the search area), the pass flags, and
+    the source of the decision functions, so editing a prior or a factor invalidates old results too."""
+    settings = [CACHE_SCHEMA, model_id or seg.DINO_MODEL, PROMPT_CORE, PROMPT, bool(fine), bool(template),
+                seg.config_fingerprint(),
+                BOX_THRESHOLD, DISTRACTOR_MIN, NMS_IOU, TILE_ASPECT, TILE_OVERLAP, FINE_TILE_SCALE,
+                FINE_MAX_TILE_AREA_FRAC, EDGE_PX, CROP_MARGIN, GREY, MIN_IN_MASK, MAX_BOX_AREA_FRAC, MIN_BOX_PX,
+                GROUND_TOL, GROUND_TOL_BOX, ACCEPT_SCORE, GROUP_MARGIN_ACCEPT, TYPE_MARGIN_FLAG, OTHER_PRIOR,
+                CONTAIN_INNER_IN_OUTER, CONTAIN_AREA_RATIO, GARAGE_MIN_SCORE, GARAGE_MIN_LEAD,
+                list(TEMPLATE_SCALES), list(TEMPLATE_SQUEEZE), TEMPLATE_MAX_PER_ROW, TEMPLATE_NCC_MIN,
+                TEMPLATE_MAX_CANDIDATES, TEMPLATE_CONTEXT, TEMPLATE_BAND_PAD,
+                [inspect.getsource(globals()[f]) for f in _LOGIC]]
+    return hashlib.sha256(json.dumps(settings).encode()).hexdigest()[:8]
+
+
+def cache_path(photo, model_id=None, fine=True, template=True):
+    return OPENINGS_CACHE_DIR / f"{seg.image_sha256(photo)[:16]}_{config_fingerprint(model_id, fine, template)}.json"
+
+
+def load_cached(photo, *, model_id=None, fine=True, template=True):
+    """The cached result for these exact bytes and this exact configuration, else None. No torch, no OpenCV."""
+    path = cache_path(photo, model_id, fine, template)
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def save_cached(photo, res, *, model_id=None, fine=True, template=True):
+    path = cache_path(photo, model_id, fine, template)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(res, indent=2), encoding="utf-8")
+    return path
+
+
+def import_openings(src):
+    """Copy another machine's <sha16>_<config>.json results into the cache (mirrors check_photos.import_masks).
+    A configuration mismatch shows up as "no cached openings" and means the two checkouts differ."""
+    OPENINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in Path(src).iterdir():
+        if f.suffix.lower() == ".json":
+            shutil.copy2(f, OPENINGS_CACHE_DIR / f.name)
+            n += 1
+    print(f"imported {n} files into {OPENINGS_CACHE_DIR}")
+    return n
+
+
+def export_openings(dst):
+    """Copy the cached results out, to hand to a machine without torch. The pickled DINO outputs stay behind."""
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in sorted(OPENINGS_CACHE_DIR.glob("*.json")) if OPENINGS_CACHE_DIR.is_dir() else []:
+        shutil.copy2(f, dst / f.name)
+        n += 1
+    print(f"exported {n} files from {OPENINGS_CACHE_DIR} to {dst}")
+    return n
+
+
+def openings_for(photo, detector=None, *, model_id=None, fine=True, template=True, use_cache=True, memo=None):
+    """-> (result, from_cache). Cached result if there is one, else compute (needs torch) and cache it."""
+    if use_cache:
+        res = load_cached(photo, model_id=model_id, fine=fine, template=template)
+        if res is not None:
+            return res, True
+    if detector is None:
+        try:
+            detector = Detector(model_id or seg.DINO_MODEL)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"no cached openings for {Path(photo).name} (key {cache_path(photo, model_id, fine, template).name}) "
+                f"and the detector cannot run here ({exc}). Import them from a machine that has them: "
+                f"python scripts/check_photos.py --import-openings DIR") from exc
+    res = detect_openings(photo, detector, fine=fine, template=template, memo=memo)
+    if use_cache:
+        save_cached(photo, res, model_id=model_id, fine=fine, template=template)
+    return res, False
+
+
 def counts(res):
     by = {}
     for o in res["openings"]:
@@ -727,6 +817,7 @@ def main():
     ap.add_argument("--out-dir", default=str(OUT_DIR))
     ap.add_argument("--no-fine", action="store_true", help="skip the half-size tiling pass")
     ap.add_argument("--no-template", action="store_true", help="skip template gap-fill")
+    ap.add_argument("--no-cache", action="store_true", help="ignore and do not write the cached result")
     ap.add_argument("--no-dino-cache", action="store_true", help="ignore and do not write the on-disk DINO cache")
     ap.add_argument("--ablate", action="store_true",
                     help="also report counts with and without the fine pass and the template gap-fill")
@@ -734,21 +825,35 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    det = Detector(args.model)
+    det = None  # built on first need: a fully cached run never imports torch
     want = (not args.no_fine, not args.no_template)
+    use_cache = not args.no_cache
     for p in args.photos:
         p = Path(p)
-        cache = None if args.no_dino_cache else memo_path(p, args.model)
-        memo = pickle.loads(cache.read_bytes()) if cache is not None and cache.is_file() else {}
-        n_memo = len(memo)
-        if args.ablate:
+        from_cache = False
+        cache, memo, n_memo = None, {}, 0
+        if args.ablate:  # the variants are computed, whatever is cached; only the chosen one is cached
+            det = det or Detector(args.model)
+            cache = None if args.no_dino_cache else memo_path(p, args.model)
+            memo = pickle.loads(cache.read_bytes()) if cache is not None and cache.is_file() else {}
+            n_memo = len(memo)
             variants = {"base": (False, False), "+fine": (True, False),
                         "+template": (False, True), "+fine+template": (True, True)}
             results = {n: detect_openings(p, det, fine=f, template=t, memo=memo) for n, (f, t) in variants.items()}
             res = next(r for n, r in results.items() if variants[n] == want)
-            res["ablation"] = {n: counts(r) for n, r in results.items()}
+            if use_cache:
+                save_cached(p, res, model_id=args.model, fine=want[0], template=want[1])
+            res = {**res, "ablation": {n: counts(r) for n, r in results.items()}}
         else:
-            res = detect_openings(p, det, fine=want[0], template=want[1], memo=memo)
+            hit = use_cache and load_cached(p, model_id=args.model, fine=want[0], template=want[1]) is not None
+            if not hit:  # only computing needs the detector and the DINO memo
+                det = det or Detector(args.model)
+                if not args.no_dino_cache:
+                    cache = memo_path(p, args.model)
+                    memo = pickle.loads(cache.read_bytes()) if cache.is_file() else {}
+                    n_memo = len(memo)
+            res, from_cache = openings_for(p, det, model_id=args.model, fine=want[0], template=want[1],
+                                           use_cache=use_cache, memo=memo)
         if cache is not None and len(memo) > n_memo:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_bytes(pickle.dumps(memo))
@@ -757,7 +862,8 @@ def main():
         c = counts(res)
         print(f"{p.name}: {c['total']} openings  " +
               "  ".join(f"{k}={v}" for k, v in c["by_type_decision"].items()) +
-              f"  (template boxes: {res['passes']['template_boxes']})  -> {out_dir / (p.stem + '.png')}")
+              f"  (template boxes: {res['passes']['template_boxes']}{', cached' if from_cache else ''})"
+              f"  -> {out_dir / (p.stem + '.png')}")
         for n, cc in res.get("ablation", {}).items():
             print(f"    {n:<15} {cc['total']:>3}  " + "  ".join(f"{k}={v}" for k, v in cc["by_type_decision"].items()))
 

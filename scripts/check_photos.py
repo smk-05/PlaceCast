@@ -13,10 +13,18 @@ For every photos/<building>_<n>.jpg:
 
     uv run python scripts/check_photos.py
     uv run python scripts/check_photos.py --import-masks path/to/owens/masks
+    uv run python scripts/check_photos.py --import-openings path/to/owens/openings
+    uv run python scripts/check_photos.py --export-openings path/to/hand/over
 
 --import-masks copies Owen's <sha>_<config>.png/.json pairs into the cache.
 The config hash must match this checkout's perception/segment.py settings; a
 mismatch shows up as "no mask" and means we are on different commits.
+
+--import-openings / --export-openings do the same for the door/window results
+(perception/openings.py, .cache/perception/openings/<sha16>_<config>.json).
+They load without torch, so a laptop without it can use what a GPU machine
+computed. The config hash covers perception/openings.py's settings and
+decision code; a mismatch shows up as "openings: none" for the same reason.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ sys.path.insert(0, str(ROOT))
 
 from geo import exif  # noqa: E402
 from geo.footprint import fetch_osm, geocode, select_footprint  # noqa: E402
+from perception.openings import export_openings, import_openings, load_cached  # noqa: E402
 from perception.segment import CACHE_DIR, cache_paths, image_sha256  # noqa: E402
 
 PHOTOS = ROOT / "photos"
@@ -114,6 +123,11 @@ def check(photo: Path) -> bool:
     else:
         print("  mask: none yet -> run with --perception real only after Owen's "
               "mask files are imported")
+    res = load_cached(photo)
+    if res is not None:
+        print(f"  openings: cached, {len(res['openings'])} boxes")
+    else:
+        print("  openings: none cached for this checkout's config (import them, or compute with torch)")
     return ok
 
 
@@ -133,11 +147,17 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("--import-masks", type=Path, default=None)
+    ap.add_argument("--import-openings", type=Path, default=None)
+    ap.add_argument("--export-openings", type=Path, default=None)
     ap.add_argument("photos", nargs="*", type=Path)
     args = ap.parse_args()
 
     if args.import_masks:
         import_masks(args.import_masks)
+    if args.import_openings:
+        import_openings(args.import_openings)
+    if args.export_openings:
+        export_openings(args.export_openings)
 
     photos = args.photos or sorted(p for p in PHOTOS.iterdir()
                                    if p.suffix.lower() in EXTS)
