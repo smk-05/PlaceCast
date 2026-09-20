@@ -46,7 +46,9 @@ it lies on (`wall_index`, over the exterior ring then any holes) and takes that 
 `bearing_deg` is that normal's compass bearing through geo.coords.theta_to_heading. Roof hits and misses are REVIEW.
 The marker position is offset OFFSET_M (2 cm) outward along the normal. The four box corners are intersected with
 the INFINITE plane of the wall the centre ray hit (not the prism mesh); a corner is valid within the wall's extent
-+- 0.5 m and from 1 m below ground to the roof, and "corner rays missed" is flagged only if one fails that.
++- tol and from tol below ground to the roof, and "corner rays missed" is flagged only if one fails that. tol =
+max(0.5 m, d x tan 1.25 deg) is the camera fit's angular uncertainty at d, the camera-to-wall distance along the centre
+ray (2.5 m at 114 m); it is recorded per opening as corner_tolerance_m.
 width_m / height_m come from those corner points, bottom_above_ground_m from the two bottom
 corners. Doors, entrances and garage doors whose bottom is more than
 DOOR_MAX_BOTTOM_M above ground go to REVIEW: a real door reaches the ground.
@@ -107,8 +109,11 @@ RASTER_MAX_SIDE = 320  # the refinement scores silhouettes on a downscaled mask
 NEAR_M = 0.5
 TIE_TOL = 1e-9
 WALL_HIT_TOL_M = 0.05  # a wall hit must lie this close to a footprint edge in plan
-CORNER_EXTENT_TOL_M = 0.5  # a corner may lie this far beyond the wall's ends ...
-CORNER_BELOW_GROUND_M = 1.0  # ... and this far below ground; its upper limit is the roof
+# A corner may lie this far beyond the wall's ends AND this far below ground (its upper limit is the roof). The
+# tolerance is the camera fit's angular uncertainty, so it grows with distance: max(0.5 m, d x tan(1.25 deg)), d being
+# the camera-to-wall distance along the centre ray (2.5 m at 114 m). See corner_tolerance().
+CORNER_TOL_MIN_M = 0.5
+CORNER_TOL_ANGLE_DEG = 1.25
 
 
 # --------------------------------------------------------------------- prism
@@ -193,6 +198,15 @@ class PinholeCamera:
         d = (forward[None] + right[None] * ((px - self.width / 2) / self.f_px)[:, None]
              - up[None] * ((py - self.height / 2) / self.f_px)[:, None])
         return d / np.linalg.norm(d, axis=1, keepdims=True)
+
+    @property
+    def hfov_deg(self):
+        """The photo's horizontal / vertical field of view, for a viewer that wants to look through this camera."""
+        return math.degrees(2.0 * math.atan(self.width / 2.0 / self.f_px))
+
+    @property
+    def vfov_deg(self):
+        return math.degrees(2.0 * math.atan(self.height / 2.0 / self.f_px))
 
     def project(self, points):
         """Full-resolution pixel coordinates (N, 2) of ENU points; the inverse of `rays` along a ray."""
@@ -338,6 +352,8 @@ class CameraFit:
             "yaw_offset_deg": self.yaw_offset_deg, "camera_pitch_deg": self.camera.pitch_deg,
             "camera_position_enu": list(self.camera.position), "position_offset_m": [self.dx_m, self.dy_m],
             "focal_scale": self.focal_scale, "f_px": self.camera.f_px, "f_px_exif": self.initial.f_px,
+            "image_size": [self.camera.width, self.camera.height], "hfov_deg": self.camera.hfov_deg,
+            "vfov_deg": self.camera.vfov_deg,
             "at_grid_edge": list(self.at_edge), "reliable": self.reliable, "reasons": list(self.why),
         }
 
@@ -485,13 +501,19 @@ def cast_openings(prism, camera, openings, bbox_px, source_photo=None):
                        is_wall[5 * n : 5 * n + 5], source_photo) for n, (i, op) in enumerate(kept)]
 
 
-def _corner_points(prism, wall_index, origin, rays):
+def corner_tolerance(distance_m):
+    """How far a corner ray may miss the wall's extent, or the ground, before it counts as missed: the camera fit's
+    angular uncertainty (CORNER_TOL_ANGLE_DEG) at `distance_m`, never less than CORNER_TOL_MIN_M."""
+    return max(CORNER_TOL_MIN_M, float(distance_m) * math.tan(math.radians(CORNER_TOL_ANGLE_DEG)))
+
+
+def _corner_points(prism, wall_index, origin, rays, tol):
     """Intersect the four corner rays (TL, TR, BR, BL) with the INFINITE vertical plane of a wall.
 
     The corners of a box on a tall or oblique wall often fall on a neighbouring surface, past a corner of the
     footprint or over an edge; the plane is the surface the opening is ON, so that is where they belong.
     -> (points (4, 3), valid (4,)). A corner is valid when its ray reaches the plane's outer face and it lands within
-    the wall's horizontal extent +- CORNER_EXTENT_TOL_M and between CORNER_BELOW_GROUND_M below ground and the roof."""
+    the wall's horizontal extent +- `tol` and between `tol` below ground and the roof."""
     wall = prism.walls[wall_index]
     n = np.array([wall["normal"][0], wall["normal"][1], 0.0])
     p0 = np.array([wall["p0"][0], wall["p0"][1], 0.0])
@@ -502,8 +524,8 @@ def _corner_points(prism, wall_index, origin, rays):
         t = np.where(toward, ((p0 - origin) @ n) / denom, np.nan)
     pts = origin + t[:, None] * rays
     along = (pts[:, :2] - np.asarray(wall["p0"])) @ u
-    valid = (toward & (t > 0) & (along >= -CORNER_EXTENT_TOL_M) & (along <= wall["length_m"] + CORNER_EXTENT_TOL_M)
-             & (pts[:, 2] >= -CORNER_BELOW_GROUND_M) & (pts[:, 2] <= prism.height_m))
+    valid = (toward & (t > 0) & (along >= -tol) & (along <= wall["length_m"] + tol)
+             & (pts[:, 2] >= -tol) & (pts[:, 2] <= prism.height_m))
     return pts, valid
 
 
@@ -515,7 +537,7 @@ def _place_one(index, op, prism, origin, rays, hits, is_wall, source_photo):
         "group_margin": op.get("group_margin"), "source_photo": source_photo,
         "wall_index": None, "normal_enu": None, "bearing_deg": None, "hit_enu": None, "position_enu": None,
         "lat": None, "lon": None, "height_above_ground_m": None, "width_m": None, "height_m": None,
-        "bottom_above_ground_m": None, "corner_hits": 0,
+        "bottom_above_ground_m": None, "corner_hits": 0, "corner_tolerance_m": None,
     }
 
     def review(reason):
@@ -542,15 +564,17 @@ def _place_one(index, op, prism, origin, rays, hits, is_wall, source_photo):
 
     bottoms = []
     if rec["wall_index"] is not None:  # the corners only mean something on the wall the centre ray found
-        pts, valid = _corner_points(prism, rec["wall_index"], origin, rays[1:])
+        tol = corner_tolerance(np.linalg.norm(hits[0] - origin))
+        rec["corner_tolerance_m"] = tol
+        pts, valid = _corner_points(prism, rec["wall_index"], origin, rays[1:], tol)
         rec["corner_hits"] = int(valid.sum())
         if valid.all():
             tl, tr, br, bl = pts
             rec["width_m"] = float((np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2)
             rec["height_m"] = float((np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2)
         else:
-            review(f"{int((~valid).sum())} of 4 corner rays missed the wall (past its ends by more than "
-                   f"{CORNER_EXTENT_TOL_M} m, or below ground / above the roof): size unreliable")
+            review(f"{int((~valid).sum())} of 4 corner rays missed the wall (past its ends or more than {tol:.1f} m "
+                   "below ground, or above the roof): size unreliable")
         bottoms = [pts[k, 2] for k in (2, 3) if valid[k]]  # BR, BL
     too_wide = op["type"] == "window" and rec["width_m"] is not None and rec["width_m"] > MAX_WINDOW_WIDTH_M
     too_tall = rec["height_m"] is not None and rec["height_m"] > MAX_OPENING_HEIGHT_M

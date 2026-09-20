@@ -176,46 +176,107 @@ def test_the_scorched_facade_adds_rust_streaks_and_the_photo_one_does_not():
 
 # ---- roof --------------------------------------------------------------------------------------------------
 
+ROOF_SIZE = (100.0, 60.0)  # metres, in the roof's own frame
 
-def test_the_roof_textures_are_dark_seamless_and_have_the_described_structure():
+
+def _blurred_luma(tile, sigma_m):
+    import cv2
+
+    ppm = tile.shape[1] / ROOF_SIZE[0]
+    return cv2.GaussianBlur(pt._luma(tile), (0, 0), sigma_m * ppm)
+
+
+def _shift_correlation(field, shift_m):
+    px = int(round(shift_m * field.shape[1] / ROOF_SIZE[0]))
+    a, b = field[:, :-px].ravel(), field[:, px:].ravel()
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def test_the_roof_is_one_dark_low_contrast_texture_over_the_whole_roof():
     walls = (140, 130, 120)
-    photo, scorched = pt.roof_texture("photo", walls, 1), pt.roof_texture("scorched", walls, 1)
-    assert photo.shape == scorched.shape == (512, 512, 3)
+    photo, scorched = pt.roof_texture("photo", walls, ROOF_SIZE, 1), pt.roof_texture("scorched", walls, ROOF_SIZE, 1)
+    assert photo.shape == scorched.shape == (720, 1200, 3)  # 12 px/m over the whole 100 x 60 m roof, not an 8 m tile
     for tile in (photo, scorched):
-        assert pt._luma(tile).mean() < 0.6 * float(pt._luma(walls)) and pt._luma(tile).mean() <= pt.ROOF_MAX_LUMA + 1e-3
-    # photo: a faint panel grid every 2 m (128 px at 64 px/m): darker rows there, but only slightly
-    rows = photo.astype(float).mean(axis=(1, 2))
-    on_grid = rows[[0, 1, 128, 129, 256, 257, 384, 385]].mean()
-    assert 0.75 * np.median(rows) < on_grid < 0.97 * np.median(rows)
-    # scorched: riveted plates 2 m (128 px) tall: dark joints between rows, and rust-orange overall
-    rows_s = scorched.astype(float).mean(axis=(1, 2))
-    assert rows_s[[127, 128, 255, 256, 383, 384]].mean() < 0.85 * np.median(rows_s)
-    assert (scorched[..., 0].astype(float) - scorched[..., 2]).mean() > (photo[..., 0].astype(float) - photo[..., 2]).mean() + 5
+        luma = pt._luma(tile)
+        assert luma.mean() < 0.6 * float(pt._luma(walls)) and luma.mean() <= pt.ROOF_MAX_LUMA + 1e-3  # darker
+        assert luma.std() / luma.mean() < 0.12  # low contrast: a plain roof from a distance
 
 
-def test_the_tiling_noise_is_periodic():
-    n = pt._wrap_noise(np.random.default_rng(3), 256, 6.0)
-    assert n.std() == pytest.approx(1.0, abs=1e-3)
-    across = np.corrcoef(n[:, 0], n[:, -1])[0, 1]  # the last column is the first column's neighbour
-    within = np.corrcoef(n[:, 100], n[:, 101])[0, 1]
-    assert across == pytest.approx(within, abs=0.05) and across > 0.8
-    assert np.corrcoef(n[0], n[-1])[0, 1] == pytest.approx(np.corrcoef(n[100], n[101])[0, 1], abs=0.05)
+def test_the_roof_does_not_repeat():
+    for style in ("photo", "scorched"):
+        field = _blurred_luma(pt.roof_texture(style, (140, 130, 120), ROOF_SIZE, 1), 1.5)
+        assert _shift_correlation(field, 0.25) > 0.95  # smooth
+        assert _shift_correlation(field, 8.0) < 0.9  # the old 8 m tile would have matched itself here
+        assert _shift_correlation(field, 20.0) < 0.5  # ... and there is no repeat at any other distance either
+        assert _shift_correlation(field, 40.0) < 0.5
+
+
+def test_the_scorched_roof_has_3_by_6_m_plates_and_the_photo_roof_a_faint_3_m_grid():
+    ppm = 12.0
+    photo, scorched = pt.roof_texture("photo", (140, 130, 120), ROOF_SIZE, 1), pt.roof_texture(
+        "scorched", (140, 130, 120), ROOF_SIZE, 1)
+    joint_rows = [int(3.0 * ppm * k) for k in range(1, 8)]  # a joint every 3 m
+    for tile, depth in ((scorched, 0.93), (photo, 0.985)):
+        rows = pt._luma(tile).mean(axis=1)
+        assert np.mean([rows[r] for r in joint_rows]) < depth * np.median(rows)
+    # plate joints across the rows: every 6 m along a row, staggered by 3 m from the row above
+    row0, row1 = pt._luma(scorched)[int(0.5 * 3 * ppm)], pt._luma(scorched)[int(1.5 * 3 * ppm)]
+    from scipy.ndimage import median_filter
+
+    def joints(row):  # one-pixel dips below the local level: plate joints, not the steps between rustier plates
+        dips = np.nonzero(row < 0.93 * median_filter(row, size=11))[0]
+        return dips[np.insert(np.diff(dips) > 2, 0, True)]
+
+    j0, j1 = joints(row0), joints(row1)
+    assert len(j0) >= 8 and np.allclose(np.diff(j0), 6.0 * ppm, atol=2)  # a joint every 6 m along a row
+    assert abs(((j1[0] - j0[0]) % (6.0 * ppm)) - 3.0 * ppm) < 2  # the next row is staggered by half a plate
+    rust = lambda tile: (tile[..., 0].astype(float) - tile[..., 2]).mean()  # noqa: E731
+    assert rust(scorched) > rust(photo) + 5  # rust-orange
+
+
+def test_the_scorched_roof_soot_is_a_few_soft_patches():
+    tile = pt.roof_texture("scorched", (140, 130, 120), ROOF_SIZE, 1)
+    luma = _blurred_luma(tile, 0.5)
+    dark = luma < 0.88 * np.median(luma)
+    assert 0.0 < dark.mean() < 0.12  # some soot, but only a small part of the roof
+
+
+def test_the_field_noise_has_unit_variance():
+    n = pt._field(np.random.default_rng(3), (200, 300), 8.0)
+    assert n.shape == (200, 300) and n.std() == pytest.approx(1.0, abs=1e-3) and abs(n.mean()) < 0.05
 
 
 def test_the_roof_stays_darker_than_walls_even_when_the_walls_are_dark():
     dark_walls = (60, 55, 50)  # a scorched building
     for style in ("photo", "scorched"):
-        tile = pt.roof_texture(style, dark_walls, 1)
+        tile = pt.roof_texture(style, dark_walls, (40.0, 30.0), 1)
         assert pt._luma(tile).mean() <= 0.6 * float(pt._luma(dark_walls)) + 1e-3
 
 
-def test_the_roof_is_a_textured_tiled_mesh_in_the_glb(tmp_path):
+def test_the_roof_frame_follows_the_longest_edge():
+    prism = _prism()  # 20 x 10 m box
+    cx, cy, theta, a0, a1, b0, b1 = pt.roof_frame(prism)
+    assert (cx, cy) == pytest.approx((0.0, 0.0), abs=1e-6)
+    assert (a1 - a0, b1 - b0) == pytest.approx((20.0, 10.0), abs=1e-6)  # plates run along the 20 m side
+    from shapely.geometry import box as shapely_box
+
+    rotated = op.prism_from_polygons([__import__("shapely.affinity", fromlist=["rotate"]).rotate(
+        shapely_box(-10, -5, 10, 5), 33.0, origin=(0, 0))], 8.0)
+    _, _, th, a0, a1, b0, b1 = pt.roof_frame(rotated)
+    assert (a1 - a0, b1 - b0) == pytest.approx((20.0, 10.0), abs=1e-6)  # still aligned once the building is turned
+    assert abs(((np.degrees(th) - 33.0 + 90) % 180) - 90) < 1e-6 or abs(((np.degrees(th) - 33.0) % 180)) < 1e-6
+
+
+def test_the_roof_is_a_textured_mesh_covering_the_texture_once_in_the_glb(tmp_path):
     prism, bake, gltf = _glb(tmp_path)
     prim = gltf.meshes[{n.name: n for n in gltf.nodes}["roof"].mesh].primitives[0]
     uv, pos = _accessor(gltf, prim.attributes.TEXCOORD_0), _accessor(gltf, prim.attributes.POSITION)
-    assert uv == pytest.approx(pos[:, :2] / pt.ROOF_TILE_M) or uv[:, 0] == pytest.approx(pos[:, 0] / pt.ROOF_TILE_M)
+    expected = pt.roof_uv(bake.roof_frame, pos[:, :2])
+    assert uv[:, 0] == pytest.approx(expected[:, 0], abs=1e-5)
+    assert uv[:, 1] == pytest.approx(1.0 - expected[:, 1], abs=1e-5)  # trimesh flips v to glTF's top-left origin
+    assert uv.min() >= -1e-6 and uv.max() <= 1 + 1e-6  # every UV is inside the texture: nothing wraps or repeats
     assert gltf.materials[prim.material].pbrMetallicRoughness.baseColorTexture is not None
-    assert len(gltf.images) == 2  # the wall atlas and the roof tile
+    assert len(gltf.images) == 2  # the wall atlas and the roof map
 
 
 def test_texels_behind_a_hole_in_the_mask_are_not_visible():

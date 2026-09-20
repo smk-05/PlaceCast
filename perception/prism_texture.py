@@ -34,14 +34,16 @@ Texels the camera cannot see are filled, never left blank and NEVER stretched or
     streaks. The photographed area fades into it over BLEND_M (0.5 m), so there is no hard edge.
 `WallTexture.source` records "photo" (coverage >= STRONG_COVERAGE), "partial" (>= KEEP_COVERAGE) or "procedural"
 (a wall whose own visible texels are discarded as too few).
-The roof is procedural too (not visible from the ground): a dark membrane with a faint panel grid for the photo
-variant; riveted rusty steel plates about 2 x 4 m with soot for the scorched one; always darker than the walls.
+The roof is procedural too (not visible from the ground): ONE texture over the whole roof, not a repeating tile,
+in the footprint's own axes. Photo variant: a dark membrane with a faint panel grid. Scorched: steel plates 3 x 6 m,
+each slightly more or less rusty, a few soft soot patches. Low contrast, so from far away it reads as a plain weathered
+roof; always darker than the walls.
 
 glb. Vertices are ENU metres (x east, y north, z up): the frame web/src/main.js uses for the opening markers, with
 the record's origin and ground. That is not glTF's Y-up convention on purpose: Cesium is told upAxis Z / forwardAxis X,
 exactly as for the generated-mesh path, so it applies no axis correction and modelMatrix = enuToFixed places the model.
-Walls: PBR, metallic 0.4, roughness 0.75, one atlas texture. Roof: metallic 0.6, roughness 0.55, one tiled texture
-(UV = ENU x, y over ROOF_TILE_M metres, glTF's default repeat wrapping).
+Walls: PBR, metallic 0.4, roughness 0.75, one atlas texture. Roof: metallic 0.6, roughness 0.55, one texture over
+the whole roof (UV = position in `roof_frame`, so it never wraps).
 
 Usage: python perception/prism_texture.py RUN_DIR PHOTO MASK [--scorched EDIT.png [--edit-mask MASK.png]] [--force]
 """
@@ -85,7 +87,8 @@ NOISE_SIGMA = 0.035
 PANEL_TONE_SIGMA = 0.025
 SEAM_DARKEN, FLOOR_LINE_DARKEN = 0.84, 0.80
 RUST_RGB = (150, 72, 32)
-ROOF_TILE_M, ROOF_PPM = 8.0, 64
+ROOF_PPM, ROOF_MAX_SIDE = 12.0, 2048  # one texture for the whole roof: px/m, and its longest side
+ROOF_PLATE_M = (3.0, 6.0)  # scorched steel plates: 3 m tall rows of 6 m plates
 ROOF_MEMBRANE_RGB = (56.0, 58.0, 62.0)
 ROOF_MAX_LUMA = 0.20  # the roof's mean luminance is at most this ...
 ROOF_WALL_RATIO = 0.6  # ... and at most this fraction of the walls'
@@ -112,7 +115,8 @@ class Bake:
     atlas: np.ndarray = None  # (A_h, A_w, 3) uint8
     atlas_visible: np.ndarray = None  # (A_h, A_w) bool
     atlas_used: np.ndarray = None  # (A_h, A_w) bool: inside some wall's rectangle
-    roof_tile: np.ndarray = None  # (S, S, 3) uint8, ROOF_TILE_M metres square
+    roof_map: np.ndarray = None  # (H, W, 3) uint8: one texture spanning the whole roof, no tiling
+    roof_frame: tuple = ()  # (cx, cy, theta, a_min, a_max, b_min, b_max): where roof_map sits on the roof (roof_frame())
     base_rgb: tuple = ()  # the mean colour of the visible wall texels: what the procedural facade is built from
     rects: list = field(default_factory=list)  # per wall (x, y, w, h) in the atlas, excluding the PAD ring
 
@@ -378,12 +382,29 @@ def fill_walls(prism, raw, ppm, style="photo"):
 # ------------------------------------------------------------ procedural roof
 
 
-def _wrap_noise(rng, size, sigma):
-    """Unit-variance noise that tiles seamlessly (Gaussian-filtered in the Fourier domain)."""
-    freq = np.fft.fftfreq(size)
-    gauss = np.exp(-2.0 * (np.pi * sigma) ** 2 * (freq[:, None] ** 2 + freq[None, :] ** 2))  # periodic by construction
-    n = np.fft.ifft2(np.fft.fft2(rng.normal(0.0, 1.0, (size, size))) * gauss).real.astype(np.float32)
-    return n / max(float(n.std()), 1e-6)
+def roof_frame(prism):
+    """A frame aligned with the footprint's longest edge, and the roof's bounds in it: (cx, cy, theta, a_min, a_max,
+    b_min, b_max). The roof texture is laid out in this frame so its plates run parallel to the building."""
+    edge = max(prism.walls, key=lambda w: w["length_m"])
+    d = np.asarray(edge["p1"]) - np.asarray(edge["p0"])
+    theta = math.atan2(d[1], d[0])
+    pts = np.concatenate([np.asarray(p.exterior.coords)[:-1] for p in prism.polygons])  # without the closing repeat
+    cx, cy = pts.mean(axis=0)
+    a, b = _to_frame(pts, cx, cy, theta)
+    return (float(cx), float(cy), theta, float(a.min()), float(a.max()), float(b.min()), float(b.max()))
+
+
+def _to_frame(xy, cx, cy, theta):
+    x, y = np.asarray(xy)[:, 0] - cx, np.asarray(xy)[:, 1] - cy
+    c, s = math.cos(theta), math.sin(theta)
+    return x * c + y * s, -x * s + y * c
+
+
+def roof_uv(frame, xy):
+    """UV (v up, OpenGL convention: trimesh flips it on export) of ENU (x, y) points in the roof texture's frame."""
+    cx, cy, theta, a0, a1, b0, b1 = frame
+    a, b = _to_frame(xy, cx, cy, theta)
+    return np.column_stack([(a - a0) / (a1 - a0), (b - b0) / (b1 - b0)])
 
 
 def _luma(rgb):
@@ -391,56 +412,61 @@ def _luma(rgb):
     return (0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]) / 255.0
 
 
-def roof_texture(style, wall_rgb, seed=0):
-    """A seamless ROOF_TILE_M x ROOF_TILE_M tile, (S, S, 3) uint8, repeated across the roof.
+def _field(rng, shape, sigma_px):
+    """Unit-variance smooth noise over `shape` (Gaussian-filtered white noise): one field across the WHOLE roof."""
+    fy, fx = np.fft.fftfreq(shape[0]), np.fft.fftfreq(shape[1])
+    gauss = np.exp(-2.0 * (np.pi * sigma_px) ** 2 * (fy[:, None] ** 2 + fx[None, :] ** 2))
+    n = np.fft.ifft2(np.fft.fft2(rng.normal(0.0, 1.0, shape)) * gauss).real.astype(np.float32)
+    n -= n.mean()
+    return n / max(float(n.std()), 1e-6)
 
-    photo:    dark grey membrane, a faint panel grid (every 2 m), noise.
-    scorched: riveted steel plates about 2 x 4 m (staggered rows), rust-orange variation from plate to plate and
-              within each, soot, noise.
+
+def roof_texture(style, wall_rgb, size_m, seed=0):
+    """One texture for the whole roof, (H, W, 3) uint8, `size_m` = (width, height) of the roof in its frame. Not a
+    repeating tile: every noise field spans the entire roof, so nothing repeats. Low contrast: from 200 m it should
+    read as a plain weathered roof, with detail (plate joints, rivets, grain) only up close.
+
+    photo:    dark grey membrane, a faint panel grid every 3 m, broad tonal drift, fine grain.
+    scorched: steel plates 3 x 6 m in staggered rows, each a little more or less rusty, a few soft soot patches,
+              faint joints and rivets.
     Scaled so its mean luminance stays below both ROOF_MAX_LUMA and ROOF_WALL_RATIO x the walls' (`wall_rgb`)."""
     rng = np.random.default_rng([seed, {"photo": 0, "scorched": 1}.get(style, 2)])
-    s = int(ROOF_TILE_M * ROOF_PPM)
-    yy, xx = np.mgrid[0:s, 0:s]
-    fine = _wrap_noise(rng, s, 1.2)
-    broad = _wrap_noise(rng, s, 40.0)
+    ppm = min(ROOF_PPM, ROOF_MAX_SIDE / max(size_m))
+    w_px, h_px = max(8, math.ceil(size_m[0] * ppm)), max(8, math.ceil(size_m[1] * ppm))
+    shape = (h_px, w_px)
+    yy, xx = np.mgrid[0:h_px, 0:w_px].astype(np.float32)
+    broad = _field(rng, shape, 6.0 * ppm)
+    mid = _field(rng, shape, 1.2 * ppm)
+    fine = _field(rng, shape, 0.8)
 
     if style == "scorched":
         steel, rust = np.array([72.0, 66.0, 62.0]), np.array(RUST_RGB, np.float32)
-        plate_h, plate_w = int(2.0 * ROOF_PPM), int(4.0 * ROOF_PPM)
-        row = yy // plate_h
-        col = ((xx + (row % 2) * (plate_w // 2)) % s) // plate_w  # alternate rows stagger by half a plate
-        n_rows, n_cols = s // plate_h, s // plate_w
-        amount = rng.uniform(0.0, 0.6, (n_rows, n_cols))[row, col]
-        mix = np.clip(amount + 0.12 * broad, 0.0, 0.85)[..., None]  # rust also varies within a plate
+        plate_h, plate_w = ROOF_PLATE_M[0] * ppm, ROOF_PLATE_M[1] * ppm
+        row = np.floor(yy / plate_h).astype(int)
+        shifted = xx + (row % 2) * plate_w / 2  # alternate rows stagger by half a plate
+        col = np.floor(shifted / plate_w).astype(int)
+        amount = rng.uniform(0.0, 0.3, (row.max() + 1, col.max() + 1))[row, col]
+        mix = np.clip(amount + 0.06 * broad + 0.03 * mid, 0.0, 0.5)[..., None]
         img = steel * (1.0 - mix) + rust * mix
-        # seams (wrapped, so the tile repeats): plate joints run along the row boundaries and the column joints
-        seam = np.zeros((s, s), np.float32)
-        for r in range(n_rows):
-            seam[[(r * plate_h + d) % s for d in (-1, 0, 1)], :] = 1.0
-            off = (r % 2) * (plate_w // 2)
-            for c in range(n_cols):
-                x = (c * plate_w + off) % s
-                seam[r * plate_h : (r + 1) * plate_h, [(x + d) % s for d in (-1, 0, 1)]] = 1.0
-        img *= (1.0 - 0.45 * seam)[..., None]
-        rivets = np.zeros((s, s), np.uint8)
-        step, inset = ROOF_PPM // 2, 8  # a rivet every 0.5 m, set in from each joint
-        for r in range(n_rows):
-            off = (r % 2) * (plate_w // 2)
-            for y in (r * plate_h + inset, (r + 1) * plate_h - inset):
-                for x in range(off + inset, off + s, step):
-                    cv2.circle(rivets, (x % s, y % s), 3, 255, -1)
-        rivets = cv2.GaussianBlur(rivets, (0, 0), 0.8).astype(np.float32) / 255.0
-        img *= (1.0 + 0.35 * rivets)[..., None]
-        soot = np.clip(0.75 + 0.2 * _wrap_noise(rng, s, 25.0) - 0.25 * np.clip(_wrap_noise(rng, s, 6.0), 0, None), 0.35, 1.0)
+        seam = ((yy % plate_h) < 1.0) | ((shifted % plate_w) < 1.0)
+        img *= np.where(seam, 0.86, 1.0)[..., None]  # faint joints
+        step, inset = max(2, int(round(0.5 * ppm))), max(1, int(round(0.15 * ppm)))
+        rows = (np.arange(0, h_px, plate_h)[:, None] + np.array([inset, plate_h - inset])[None]).ravel().astype(int)
+        cols = np.arange(0, w_px, step)
+        rr, cc = np.meshgrid(rows[rows < h_px], cols)
+        rivet = np.zeros(shape, np.float32)
+        rivet[rr.ravel(), cc.ravel()] = 1.0
+        img *= (1.0 + 0.10 * cv2.GaussianBlur(rivet, (0, 0), 0.7) * 4.0)[..., None]
+        soot = 1.0 - 0.25 * np.clip((_field(rng, shape, 2.5 * ppm) - 1.5) / 1.0, 0.0, 1.0)  # only the tail: few patches
         img *= soot[..., None]
-        img *= (1.0 + 0.05 * fine)[..., None]
+        img *= (1.0 + 0.02 * fine + 0.02 * mid)[..., None]
     else:
-        img = np.empty((s, s, 3), np.float32)
+        img = np.empty((h_px, w_px, 3), np.float32)
         img[:] = ROOF_MEMBRANE_RGB
-        grid = ROOF_PPM * 2  # a panel grid every 2 m, faint
-        lines = ((xx % grid) < 2) | ((yy % grid) < 2)
-        img *= np.where(lines, 0.90, 1.0)[..., None]
-        img *= (1.0 + 0.05 * fine + 0.06 * broad)[..., None]
+        grid = 3.0 * ppm
+        lines = ((xx % grid) < 1.0) | ((yy % grid) < 1.0)
+        img *= np.where(lines, 0.95, 1.0)[..., None]
+        img *= (1.0 + 0.03 * broad + 0.015 * mid + 0.015 * fine)[..., None]
 
     target = min(ROOF_MAX_LUMA, ROOF_WALL_RATIO * float(_luma(wall_rgb)))
     current = float(_luma(img).mean())
@@ -512,16 +538,18 @@ def bake_textures(prism, camera, image, mask, ppm=PPM, edit_mask=None, halo_band
     raw = [bake_wall(prism, camera, wall, size, image, eroded, halo_zone) for wall, size in zip(prism.walls, sizes)]
     walls, base = fill_walls(prism, raw, ppm, style)
     atlas, visible, used, rects = build_atlas(prism, walls, ppm, sizes)
+    frame = roof_frame(prism)
     return Bake(walls, ppm, atlas=atlas, atlas_visible=visible, atlas_used=used, rects=rects,
-                roof_tile=roof_texture(style, base, SEED), base_rgb=tuple(int(round(c)) for c in base))
+                roof_map=roof_texture(style, base, (frame[4] - frame[3], frame[6] - frame[5]), SEED), roof_frame=frame,
+                base_rgb=tuple(int(round(c)) for c in base))
 
 
 def write_previews(bake, prefix):
     """<prefix>_atlas.png (what is baked), <prefix>_atlas_visibility.png (green: from the photo, red: filled) and
-    <prefix>_roof.png (one tile of the roof texture)."""
+    <prefix>_roof.png (the roof texture)."""
     prefix = str(prefix)
     Image.fromarray(bake.atlas).save(prefix + "_atlas.png")
-    Image.fromarray(bake.roof_tile).save(prefix + "_roof.png")
+    Image.fromarray(bake.roof_map).save(prefix + "_roof.png")
     tint = bake.atlas.astype(np.float32)
     real = bake.atlas_visible[..., None]
     tint = np.where(real, tint * 0.65 + np.array([0, 90, 0]), tint * 0.5 + np.array([120, 0, 0]))
@@ -533,8 +561,8 @@ def write_previews(bake, prefix):
 # ------------------------------------------------------------------------ glb
 
 
-def _roof_mesh(prism, tile):
-    """The roof, triangulated, with a tiled texture: UV = (x, y) / ROOF_TILE_M, and glTF wraps by repeating."""
+def _roof_mesh(prism, bake):
+    """The roof, triangulated, textured with the single roof map: UV = the vertex's position in the roof frame."""
     verts, faces = [], []
     for poly in prism.polygons:
         v2, f = trimesh.creation.triangulate_polygon(poly)
@@ -546,8 +574,9 @@ def _roof_mesh(prism, tile):
             faces.append(np.arange(3) + 3 * len(faces))
     verts = np.concatenate(verts)
     roof = trimesh.Trimesh(verts, np.array(faces), process=False)
-    roof.visual = trimesh.visual.TextureVisuals(uv=verts[:, :2] / ROOF_TILE_M, material=trimesh.visual.material.PBRMaterial(
-        baseColorTexture=Image.fromarray(tile), metallicFactor=METALLIC_ROOF, roughnessFactor=ROUGHNESS_ROOF))
+    roof.visual = trimesh.visual.TextureVisuals(uv=roof_uv(bake.roof_frame, verts[:, :2]),
+                                                material=trimesh.visual.material.PBRMaterial(
+        baseColorTexture=Image.fromarray(bake.roof_map), metallicFactor=METALLIC_ROOF, roughnessFactor=ROUGHNESS_ROOF))
     return roof
 
 
@@ -575,7 +604,7 @@ def build_glb(prism, bake, out_glb, source=None):
         baseColorTexture=Image.fromarray(bake.atlas), metallicFactor=METALLIC_WALL, roughnessFactor=ROUGHNESS_WALL))
     scene = trimesh.Scene()
     scene.add_geometry(walls, node_name="walls", geom_name="walls")
-    scene.add_geometry(_roof_mesh(prism, bake.roof_tile), node_name="roof", geom_name="roof")
+    scene.add_geometry(_roof_mesh(prism, bake), node_name="roof", geom_name="roof")
     out_glb = Path(out_glb)
     out_glb.write_bytes(scene.export(file_type="glb"))
 

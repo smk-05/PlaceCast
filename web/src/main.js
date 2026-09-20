@@ -111,7 +111,8 @@ async function show(assetId) {
     await drawBuilding(rec, ground, () => token === showToken);
     if (token !== showToken) return;
     renderPanel(rec);
-    renderMarkerControls();
+    renderMarkerControls(rec);
+    renderPhotoViewButton(rec);
     renderTextureToggle();
     flyTo(rec);
   } catch (e) {
@@ -258,7 +259,7 @@ async function drawBuilding(rec, ground, stillCurrent = () => true) {
     const textured = await drawTexturedPrism(rec, enuToFixed, stillCurrent);
     if (!stillCurrent()) return;
     if (!textured) drawFootprintPrism(rec, ground);
-    drawOpenings(rec, enuToFixed);
+    if (!cameraUnreliable(rec)) drawOpenings(rec, enuToFixed);  // an unreliable fit withholds its markers (panel says so)
   } else {
     errEl.textContent = `Unknown mesh_frame "${m2e.mesh_frame}" — not drawing anything.`;
   }
@@ -352,6 +353,7 @@ const REVIEW_RED = '#dc2828';
 const REVIEW_OUTLINE_GROW = [0, 0.05, 0.1]; // metres added to width, height and depth of each red outline
 let openingPrims = [];
 let openingsById = new Map();
+const defaultFov = viewer.camera.frustum.fov;
 
 function drawOpenings(rec, enuToFixed) {
   openingPrims = [];
@@ -440,8 +442,65 @@ openingClicks.setInputAction((click) => {
   showOpeningInfo(Cesium.defined(picked) ? openingsById.get(picked.id) : undefined);
 }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
+/** perception/openings_prism.py could not fit the photo's camera to the building (low IoU, or a best value on the edge of
+ *  the search grid): the openings are still in the record, but where they would stand is not to be trusted. */
+function cameraUnreliable(rec) {
+  return rec.openings_camera?.reliable === false;
+}
+
+function withheldNotice(rec) {
+  const cam = rec.openings_camera;
+  const n = (rec.openings || []).length;
+  if (!cameraUnreliable(rec) || !n) return '';
+  const why = [];
+  if (cam.camera_iou < 0.6) why.push('low IoU');
+  if ((cam.at_grid_edge || []).length) why.push(`${cam.at_grid_edge.join('/')} at the search-grid edge`);
+  return `<div class="flags">Camera fit unreliable (IoU ${fmt(cam.camera_iou, 2)}, ${why.join(' + ') || 'see record'}): `
+    + `${n} openings withheld for review.</div>`;
+}
+
+/**
+ * "View from photo": fly to where the photo was taken, looking the way it looked, through its field of view. All of it
+ * comes from rec.openings_camera (perception/openings_prism.py): position in the record's ENU frame, yaw (compass
+ * heading), pitch above the horizon, and the photo's horizontal / vertical field of view. Not offered when that fit is
+ * unreliable, since the camera would then be wrong by construction.
+ */
+function renderPhotoViewButton(rec) {
+  const c = rec.openings_camera;
+  if (!c || cameraUnreliable(rec) || !c.camera_position_enu || !c.hfov_deg) return;
+  metaEl.insertAdjacentHTML('afterbegin', '<div class="flags"><button id="view-from-photo">View from photo</button></div>');
+  document.getElementById('view-from-photo').addEventListener('click', () => viewFromPhoto(rec));
+}
+
+function viewFromPhoto(rec) {
+  const c = rec.openings_camera;
+  const [lat, lon] = rec.enu_origin_geodetic;
+  const enuToFixed = Cesium.Transforms.eastNorthUpToFixedFrame(
+    Cesium.Cartesian3.fromDegrees(lon, lat, rec._ground ?? 0),
+  );
+  const [e, n, u] = c.camera_position_enu;
+  const canvas = viewer.scene.canvas;
+  // Cesium's fov is the HORIZONTAL angle on a canvas wider than tall, the vertical one otherwise.
+  const wide = canvas.clientWidth >= canvas.clientHeight;
+  viewer.camera.frustum.fov = Cesium.Math.toRadians(wide ? c.hfov_deg : c.vfov_deg);
+  viewer.camera.flyTo({
+    destination: Cesium.Matrix4.multiplyByPoint(enuToFixed, new Cesium.Cartesian3(e, n, u), new Cesium.Cartesian3()),
+    orientation: {
+      heading: Cesium.Math.toRadians(c.camera_yaw_deg),
+      pitch: Cesium.Math.toRadians(c.camera_pitch_deg),
+      roll: 0,
+    },
+    duration: 2,
+  });
+}
+
 /** "Markers" on/off and the colour legend at the top of the panel (call after renderPanel, which rewrites it). */
-function renderMarkerControls() {
+function renderMarkerControls(rec) {
+  const notice = withheldNotice(rec);
+  if (notice) {
+    metaEl.insertAdjacentHTML('afterbegin', notice);
+    return;
+  }
   if (!openingPrims.length) return;
   const swatch = (css, label, border = 2) => `<span style="display:inline-block;margin:0 10px 2px 0;white-space:nowrap">`
     + `<span style="display:inline-block;width:10px;height:10px;box-sizing:content-box;border:${border}px solid ${css};`
@@ -592,6 +651,7 @@ const fmt = (v, n) => (typeof v === 'number' ? v.toFixed(n) : '-');
  * (the spec 2.3 datum trap, applied to the camera instead of the building).
  */
 function flyTo(rec) {
+  viewer.camera.frustum.fov = defaultFov;  // undo a "View from photo" field of view
   const [lat, lon] = rec.enu_origin_geodetic;
   const ground = rec._ground ?? 0;
   const target = new Cesium.BoundingSphere(

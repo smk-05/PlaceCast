@@ -405,3 +405,63 @@ def test_an_oblique_view_still_sizes_an_opening_on_the_wall_it_is_on():
     assert r["wall_index"] == _wall_index(prism, 90.0) and r["corner_hits"] == 4
     assert r["width_m"] == pytest.approx(2.0, abs=0.1) and r["height_m"] == pytest.approx(1.5, abs=0.1)
     assert r["decision"] == "ACCEPT"
+
+
+# ------------------------------------------- distance-scaled corner tolerance
+
+
+def test_corner_tolerance_is_the_angular_uncertainty_with_a_floor():
+    assert op.corner_tolerance(5.0) == 0.5 and op.corner_tolerance(20.0) == 0.5  # the 0.5 m floor
+    assert op.corner_tolerance(114.0) == pytest.approx(114.0 * math.tan(math.radians(1.25)), rel=1e-12)
+    assert op.corner_tolerance(114.0) == pytest.approx(2.49, abs=0.01)
+    assert op.corner_tolerance(50.0) < op.corner_tolerance(114.0) < op.corner_tolerance(200.0)
+
+
+def test_the_tolerance_is_recorded_per_opening_from_the_centre_ray_distance():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    a, b = _place(prism, cam, mask, [_on_south("near_ok", cam, mask, cx=0.0, z0=3.0),
+                                     _opening_off_prism("miss", cam, mask)]).openings
+    dist = float(np.linalg.norm(np.asarray(a["hit_enu"]) - np.asarray(cam.position)))
+    assert a["corner_tolerance_m"] == pytest.approx(op.corner_tolerance(dist))
+    assert a["corner_tolerance_m"] == pytest.approx(35.0 * math.tan(math.radians(1.25)), rel=0.02)
+    assert b["corner_tolerance_m"] is None  # no wall, so no corner check and nothing to record
+
+
+def _opening_off_prism(name, cam, mask):
+    return {**_on_south(name, cam, mask, cx=0.0, z0=3.0), "box_uv": [1.5, 0.4, 1.6, 0.5], "center_uv": [1.55, 0.45]}
+
+
+def test_a_far_camera_forgives_what_a_near_camera_rejects():
+    # The same wall, the same opening: its right corners overhang the building's east end by 1.0 m and its bottom
+    # corners sit 1.0 m below ground. At 114 m the tolerance is 2.5 m; at 8 m it is the 0.5 m floor.
+    prism = _prism()
+    far, near = _camera(8, -119, 0.0), _camera(8, -13, 0.0)
+    results = {}
+    for name, cam in (("far", far), ("near", near)):
+        mask = _mask(prism, cam)
+        overhang = _on_south("overhang", cam, mask, cx=9.0, z0=3.0, w=4.0, h=1.5)
+        low = _on_south("low", cam, mask, cx=3.0, z0=-1.0, w=2.0, h=4.0)
+        results[name] = _place(prism, cam, mask, [overhang, low]).openings
+    for r in results["far"]:
+        assert r["corner_tolerance_m"] > 2.0 and r["corner_hits"] == 4 and r["decision"] == "ACCEPT", r["id"]
+    for r in results["near"]:
+        assert r["corner_tolerance_m"] == pytest.approx(0.5) and r["corner_hits"] == 2 and r["decision"] == "REVIEW"
+        assert any("0.5 m below ground" in why or "past its ends" in why for why in r["reasons"])
+
+
+def test_the_roof_limit_is_not_widened_by_the_tolerance():
+    prism, cam = _prism(), _camera(8, -119, 0.0)  # a wide tolerance (2.5 m) that must not lift the roof limit
+    mask = _mask(prism, cam)
+    r, = _place(prism, cam, mask, [_on_south("over_roof", cam, mask, cx=3.0, z0=6.0, w=2.0, h=3.0)]).openings
+    assert r["corner_hits"] == 2 and r["decision"] == "REVIEW"  # the top corners (z = 9 m) are above the 8 m roof
+
+
+def test_the_stored_camera_carries_the_photos_field_of_view():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    d = _place(prism, cam, mask, [_on_south("w1", cam, mask, cx=0.0, z0=3.0)]).fit.to_dict()
+    assert d["image_size"] == [320, 240]
+    assert d["hfov_deg"] == pytest.approx(math.degrees(2 * math.atan(160 / 300)))  # 55.9 deg
+    assert d["vfov_deg"] == pytest.approx(math.degrees(2 * math.atan(120 / 300)))  # 43.6 deg
+    assert d["camera_yaw_deg"] == 0.0 and d["camera_position_enu"] == [0, -40, 1.5]
