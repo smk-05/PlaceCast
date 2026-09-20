@@ -352,3 +352,56 @@ def test_record_gets_the_openings(tmp_path):
     assert data["openings"][0]["id"] == "w1" and data["openings"][0]["bearing_deg"] == pytest.approx(180.0)
     assert data["openings_camera"]["camera_iou"] == pytest.approx(1.0)
     assert data["openings_facade_check"]["applicable"] is False
+
+
+# ------------------------------------------------- corners on the wall's plane
+
+
+def test_corners_are_intersected_with_the_walls_plane_not_the_prism_mesh():
+    # An opening at the east end of the south wall whose right corners overhang the building's corner by 0.4 m: those
+    # rays miss the mesh (they pass beside the prism) but land on the wall's plane, within the +-0.5 m tolerance.
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    op_ = _on_south("edge_window", cam, mask, cx=9.4, z0=3.0, w=2.0, h=1.5)
+    r, = _place(prism, cam, mask, [op_]).openings
+    assert r["decision"] == "ACCEPT" and r["reasons"] == [] and r["corner_hits"] == 4
+    assert r["width_m"] == pytest.approx(2.0, abs=0.05) and r["height_m"] == pytest.approx(1.5, abs=0.05)
+    assert r["bottom_above_ground_m"] == pytest.approx(3.0, abs=0.05)
+
+
+def test_a_corner_beyond_the_walls_ends_by_more_than_half_a_metre_is_flagged():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    op_ = _on_south("overhang", cam, mask, cx=9.9, z0=3.0, w=2.0, h=1.5)  # right corners 0.9 m past the end
+    r, = _place(prism, cam, mask, [op_]).openings
+    assert r["decision"] == "REVIEW" and r["corner_hits"] == 2 and r["width_m"] is None
+    assert any("2 of 4 corner rays missed the wall" in why for why in r["reasons"])
+
+
+def test_corners_may_reach_one_metre_below_ground_but_not_further():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    ok = _on_south("half_metre_down", cam, mask, cx=0.0, z0=-0.5, w=2.0, h=3.0, type_="window")
+    deep = _on_south("one_and_a_half_down", cam, mask, cx=0.0, z0=-1.5, w=2.0, h=3.5, type_="window")
+    a, b = _place(prism, cam, mask, [ok, deep]).openings
+    assert a["decision"] == "ACCEPT" and a["bottom_above_ground_m"] == pytest.approx(-0.5, abs=0.05)
+    assert b["decision"] == "REVIEW" and b["corner_hits"] == 2  # only the two top corners are on the wall
+    assert any("below ground" in why for why in b["reasons"])
+
+
+def test_a_corner_above_the_roof_is_flagged():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    op_ = _on_south("up_and_over", cam, mask, cx=0.0, z0=6.0, w=2.0, h=3.0)  # top corners at z = 9 m > the 8 m roof
+    r, = _place(prism, cam, mask, [op_]).openings
+    assert r["decision"] == "REVIEW" and r["corner_hits"] == 2
+
+
+def test_an_oblique_view_still_sizes_an_opening_on_the_wall_it_is_on():
+    # From the SE corner camera the east wall is seen at a grazing angle. Corners are placed on the east wall's plane.
+    prism, cam = _prism(), _camera(30, -30, 315.0)
+    mask = _mask(prism, cam)
+    r, = _place(prism, cam, mask, [_on_east("e", cam, mask, cy=-1.0, z0=2.0, w=2.0, h=1.5)]).openings
+    assert r["wall_index"] == _wall_index(prism, 90.0) and r["corner_hits"] == 4
+    assert r["width_m"] == pytest.approx(2.0, abs=0.1) and r["height_m"] == pytest.approx(1.5, abs=0.1)
+    assert r["decision"] == "ACCEPT"

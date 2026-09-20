@@ -103,11 +103,15 @@ async function show(assetId) {
     viewer.entities.removeAll();          // nothing uses entities any more
     viewer.scene.primitives.removeAll();
     texturedModels = {};
+    openingPrims = [];
+    openingsById = new Map();
+    showOpeningInfo(undefined);
 
     drawFootprint(rec, ground);
     await drawBuilding(rec, ground, () => token === showToken);
     if (token !== showToken) return;
     renderPanel(rec);
+    renderMarkerControls();
     renderTextureToggle();
     flyTo(rec);
   } catch (e) {
@@ -335,35 +339,123 @@ function renderTextureToggle() {
 /**
  * Facade openings on the prism (perception/openings_prism.py writes rec.openings): one thin box per opening,
  * width x height x 0.1 m, on its wall. position_enu / normal_enu are in the same ENU frame as the prism, so the
- * frame is the drawBuilding one. Local Y is up and local Z the outward normal, so local X = up x normal. REVIEW is
- * red; the other colours are per type, as in perception/openings_3d.py.
+ * frame is the drawBuilding one. Local Y is up and local Z the outward normal, so local X = up x normal.
+ *
+ * Drawn as an OUTLINE plus a ~25% alpha FILL in the type colour, so the painted windows of a textured wall show
+ * through. REVIEW does not change the fill: its outline is red and thicker (WebGL on Windows draws 1 px lines, so
+ * "thicker" is three concentric outlines, each a little larger). Every instance carries the opening's id, which
+ * viewer.scene.pick returns, so a click can show that opening's details (showOpeningInfo).
  */
 const OPENING_COLOURS = { door: '#2ea043', entrance: '#009696', garage_door: '#f58c14', window: '#286ee6' };
+const OPENING_FALLBACK = '#969696';
+const REVIEW_RED = '#dc2828';
+const REVIEW_OUTLINE_GROW = [0, 0.05, 0.1]; // metres added to width, height and depth of each red outline
+let openingPrims = [];
+let openingsById = new Map();
 
 function drawOpenings(rec, enuToFixed) {
+  openingPrims = [];
+  openingsById = new Map();
   const items = (rec.openings || []).filter(
     (o) => o.position_enu && o.normal_enu && o.width_m && o.height_m,
   );
   if (!items.length) return;
-  viewer.scene.primitives.add(new Cesium.Primitive({
-    geometryInstances: items.map((o) => {
-      const [nx, ny] = o.normal_enu;
-      const [e, n, u] = o.position_enu;
-      const local = Cesium.Matrix4.fromColumnMajorArray([-ny, nx, 0, 0, 0, 0, 1, 0, nx, ny, 0, 0, e, n, u, 1]);
-      const css = o.decision === 'REVIEW' ? '#dc2828' : (OPENING_COLOURS[o.type] || '#969696');
-      return new Cesium.GeometryInstance({
+  const fills = [];
+  const lines = [];
+  for (const o of items) {
+    openingsById.set(o.id, o);
+    const [nx, ny] = o.normal_enu;
+    const [e, n, u] = o.position_enu;
+    const local = Cesium.Matrix4.fromColumnMajorArray([-ny, nx, 0, 0, 0, 0, 1, 0, nx, ny, 0, 0, e, n, u, 1]);
+    const modelMatrix = Cesium.Matrix4.multiply(enuToFixed, local, new Cesium.Matrix4());
+    const typeColour = Cesium.Color.fromCssColorString(OPENING_COLOURS[o.type] || OPENING_FALLBACK);
+    const review = o.decision === 'REVIEW';
+    fills.push(new Cesium.GeometryInstance({
+      id: o.id,
+      geometry: Cesium.BoxGeometry.fromDimensions({
+        dimensions: new Cesium.Cartesian3(o.width_m, o.height_m, 0.1),
+        vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+      }),
+      modelMatrix,
+      attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(typeColour.withAlpha(0.25)) },
+    }));
+    const outline = review ? Cesium.Color.fromCssColorString(REVIEW_RED) : typeColour;
+    for (const grow of review ? REVIEW_OUTLINE_GROW : [0]) {
+      lines.push(new Cesium.GeometryInstance({
         id: o.id,
-        geometry: Cesium.BoxGeometry.fromDimensions({
-          dimensions: new Cesium.Cartesian3(o.width_m, o.height_m, 0.1),
-          vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
+        geometry: Cesium.BoxOutlineGeometry.fromDimensions({
+          dimensions: new Cesium.Cartesian3(o.width_m + grow, o.height_m + grow, 0.1 + grow),
         }),
-        modelMatrix: Cesium.Matrix4.multiply(enuToFixed, local, new Cesium.Matrix4()),
-        attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(Cesium.Color.fromCssColorString(css)) },
-      });
+        modelMatrix,
+        attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(outline) },
+      }));
+    }
+  }
+  const primitives = [
+    new Cesium.Primitive({
+      geometryInstances: fills,
+      appearance: new Cesium.PerInstanceColorAppearance({ translucent: true }),
+      asynchronous: false,
     }),
-    appearance: new Cesium.PerInstanceColorAppearance({ translucent: false }),
-    asynchronous: false,
-  }));
+    new Cesium.Primitive({
+      geometryInstances: lines,
+      // No renderState.lineWidth: WebGL on Windows allows 1 only, and anything else is a hard DeveloperError.
+      appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: false }),
+      asynchronous: false,
+    }),
+  ];
+  for (const p of primitives) {
+    viewer.scene.primitives.add(p);
+    openingPrims.push(p);
+  }
+}
+
+/** Details of one opening (from a click on its marker), or hidden when `o` is undefined. */
+function showOpeningInfo(o) {
+  let box = document.getElementById('opening-info');
+  if (!o) {
+    if (box) box.style.display = 'none';
+    return;
+  }
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'opening-info';
+    box.style.cssText = 'position:fixed;left:12px;bottom:12px;max-width:340px;padding:8px 10px;z-index:10;'
+      + 'background:rgba(20,20,20,.9);color:#eee;font:12px/1.45 sans-serif;border-radius:4px;';
+    document.body.appendChild(box);
+  }
+  const esc = (v) => String(v).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  const num = (v, d) => (v == null ? '-' : Number(v).toFixed(d));
+  const reasons = (o.reasons || []).map((r) => `<li>${esc(r)}</li>`).join('');
+  box.innerHTML = `<b>${esc(o.type)}</b> &middot; ${esc(o.decision)}<br>`
+    + `score ${num(o.score, 3)} &middot; bearing ${num(o.bearing_deg, 0)}&deg;<br>`
+    + `${num(o.width_m, 2)} &times; ${num(o.height_m, 2)} m`
+    + (reasons ? `<ul style="margin:4px 0 0 16px;padding:0">${reasons}</ul>` : '');
+  box.style.display = 'block';
+}
+
+const openingClicks = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+openingClicks.setInputAction((click) => {
+  const picked = viewer.scene.pick(click.position);
+  showOpeningInfo(Cesium.defined(picked) ? openingsById.get(picked.id) : undefined);
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+/** "Markers" on/off and the colour legend at the top of the panel (call after renderPanel, which rewrites it). */
+function renderMarkerControls() {
+  if (!openingPrims.length) return;
+  const swatch = (css, label, border = 2) => `<span style="display:inline-block;margin:0 10px 2px 0;white-space:nowrap">`
+    + `<span style="display:inline-block;width:10px;height:10px;box-sizing:content-box;border:${border}px solid ${css};`
+    + `background:${css}40;margin-right:4px;vertical-align:-2px"></span>${label}</span>`;
+  const legend = [['door', 'door'], ['entrance', 'entrance'], ['garage_door', 'garage'], ['window', 'window']]
+    .map(([type, label]) => swatch(OPENING_COLOURS[type], label)).join('')
+    + swatch(REVIEW_RED, 'red outline = needs review', 3);
+  metaEl.insertAdjacentHTML('afterbegin',
+    `<div class="flags"><label><input type="checkbox" id="markers-on" checked> <b>Markers</b></label>`
+    + `<div style="margin-top:4px;font-size:12px">${legend}</div></div>`);
+  document.getElementById('markers-on').addEventListener('change', (e) => {
+    for (const p of openingPrims) p.show = e.target.checked;
+    if (!e.target.checked) showOpeningInfo(undefined);
+  });
 }
 
 /**

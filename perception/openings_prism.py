@@ -44,8 +44,11 @@ Placement. Perspective rays from the camera through each opening's centre and fo
 (trimesh extrusion of the ENU footprint); the first hit is the surface. A wall hit is mapped to the footprint edge
 it lies on (`wall_index`, over the exterior ring then any holes) and takes that edge's EXACT outward normal.
 `bearing_deg` is that normal's compass bearing through geo.coords.theta_to_heading. Roof hits and misses are REVIEW.
-The marker position is offset OFFSET_M (2 cm) outward along the normal. width_m / height_m come from the corner
-hits, bottom_above_ground_m from the two bottom corners. Doors, entrances and garage doors whose bottom is more than
+The marker position is offset OFFSET_M (2 cm) outward along the normal. The four box corners are intersected with
+the INFINITE plane of the wall the centre ray hit (not the prism mesh); a corner is valid within the wall's extent
++- 0.5 m and from 1 m below ground to the roof, and "corner rays missed" is flagged only if one fails that.
+width_m / height_m come from those corner points, bottom_above_ground_m from the two bottom
+corners. Doors, entrances and garage doors whose bottom is more than
 DOOR_MAX_BOTTOM_M above ground go to REVIEW: a real door reaches the ground.
 
 Viewer. There is no glb to add child nodes to (web/src/main.js draws the prism as a Cesium polygon extrusion), so the
@@ -104,6 +107,8 @@ RASTER_MAX_SIDE = 320  # the refinement scores silhouettes on a downscaled mask
 NEAR_M = 0.5
 TIE_TOL = 1e-9
 WALL_HIT_TOL_M = 0.05  # a wall hit must lie this close to a footprint edge in plan
+CORNER_EXTENT_TOL_M = 0.5  # a corner may lie this far beyond the wall's ends ...
+CORNER_BELOW_GROUND_M = 1.0  # ... and this far below ground; its upper limit is the roof
 
 
 # --------------------------------------------------------------------- prism
@@ -476,11 +481,33 @@ def cast_openings(prism, camera, openings, bbox_px, source_photo=None):
             hits[ray_idx], tris[ray_idx] = loc, tri_idx
     is_wall = np.zeros(len(dirs), bool)  # a hit on a side face (roof and floor hits are not walls)
     is_wall[tris >= 0] = np.abs(prism.mesh.face_normals[tris[tris >= 0]][:, 2]) < 0.5
-    return [_place_one(i, op, prism, camera, hits[5 * n : 5 * n + 5], is_wall[5 * n : 5 * n + 5], source_photo)
-            for n, (i, op) in enumerate(kept)]
+    return [_place_one(i, op, prism, origin, dirs[5 * n : 5 * n + 5], hits[5 * n : 5 * n + 5],
+                       is_wall[5 * n : 5 * n + 5], source_photo) for n, (i, op) in enumerate(kept)]
 
 
-def _place_one(index, op, prism, camera, hits, is_wall, source_photo):
+def _corner_points(prism, wall_index, origin, rays):
+    """Intersect the four corner rays (TL, TR, BR, BL) with the INFINITE vertical plane of a wall.
+
+    The corners of a box on a tall or oblique wall often fall on a neighbouring surface, past a corner of the
+    footprint or over an edge; the plane is the surface the opening is ON, so that is where they belong.
+    -> (points (4, 3), valid (4,)). A corner is valid when its ray reaches the plane's outer face and it lands within
+    the wall's horizontal extent +- CORNER_EXTENT_TOL_M and between CORNER_BELOW_GROUND_M below ground and the roof."""
+    wall = prism.walls[wall_index]
+    n = np.array([wall["normal"][0], wall["normal"][1], 0.0])
+    p0 = np.array([wall["p0"][0], wall["p0"][1], 0.0])
+    u = (np.asarray(wall["p1"]) - np.asarray(wall["p0"])) / wall["length_m"]
+    denom = rays @ n
+    toward = denom < -1e-9  # the ray travels against the outward normal: it reaches the wall from outside
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = np.where(toward, ((p0 - origin) @ n) / denom, np.nan)
+    pts = origin + t[:, None] * rays
+    along = (pts[:, :2] - np.asarray(wall["p0"])) @ u
+    valid = (toward & (t > 0) & (along >= -CORNER_EXTENT_TOL_M) & (along <= wall["length_m"] + CORNER_EXTENT_TOL_M)
+             & (pts[:, 2] >= -CORNER_BELOW_GROUND_M) & (pts[:, 2] <= prism.height_m))
+    return pts, valid
+
+
+def _place_one(index, op, prism, origin, rays, hits, is_wall, source_photo):
     reasons = list(op.get("reasons") or [])
     decision = op.get("decision", "REVIEW")
     rec = {
@@ -488,7 +515,7 @@ def _place_one(index, op, prism, camera, hits, is_wall, source_photo):
         "group_margin": op.get("group_margin"), "source_photo": source_photo,
         "wall_index": None, "normal_enu": None, "bearing_deg": None, "hit_enu": None, "position_enu": None,
         "lat": None, "lon": None, "height_above_ground_m": None, "width_m": None, "height_m": None,
-        "bottom_above_ground_m": None, "corner_hits": int(is_wall[1:].sum()),
+        "bottom_above_ground_m": None, "corner_hits": 0,
     }
 
     def review(reason):
@@ -513,17 +540,22 @@ def _place_one(index, op, prism, camera, hits, is_wall, source_photo):
                        hit_enu=hits[0], position_enu=position, lat=float(lat), lon=float(lon),
                        height_above_ground_m=float(h - prism.frame.h0))
 
-    if is_wall[1:].all():
-        tl, tr, br, bl = hits[1:]
-        rec["width_m"] = float((np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2)
-        rec["height_m"] = float((np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2)
-    else:
-        review(f"{int((~is_wall[1:]).sum())} of 4 corner rays missed the prism or hit the roof: size unreliable")
+    bottoms = []
+    if rec["wall_index"] is not None:  # the corners only mean something on the wall the centre ray found
+        pts, valid = _corner_points(prism, rec["wall_index"], origin, rays[1:])
+        rec["corner_hits"] = int(valid.sum())
+        if valid.all():
+            tl, tr, br, bl = pts
+            rec["width_m"] = float((np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2)
+            rec["height_m"] = float((np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2)
+        else:
+            review(f"{int((~valid).sum())} of 4 corner rays missed the wall (past its ends by more than "
+                   f"{CORNER_EXTENT_TOL_M} m, or below ground / above the roof): size unreliable")
+        bottoms = [pts[k, 2] for k in (2, 3) if valid[k]]  # BR, BL
     too_wide = op["type"] == "window" and rec["width_m"] is not None and rec["width_m"] > MAX_WINDOW_WIDTH_M
     too_tall = rec["height_m"] is not None and rec["height_m"] > MAX_OPENING_HEIGHT_M
     if too_wide or too_tall:  # a grazing view stretches boxes along the wall
         review("implausible size (grazing view)")
-    bottoms = [hits[k, 2] for k in (3, 4) if is_wall[k]]  # BR, BL
     if bottoms:
         rec["bottom_above_ground_m"] = float(np.mean(bottoms))
     bottom = rec["bottom_above_ground_m"]

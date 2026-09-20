@@ -76,33 +76,146 @@ def test_the_baked_south_wall_matches_the_rectified_checkerboard():
     tol = 3.0 / bake.ppm
     fx, fz = (xx + 10.0) / 2.0, zz / 2.0
     near_edge = (np.minimum(fx % 1, 1 - fx % 1) * 2 < tol) | (np.minimum(fz % 1, 1 - fz % 1) * 2 < tol)
-    sel = tex.visible & ~near_edge
+    import cv2
+
+    deep = cv2.distanceTransform(np.pad(tex.visible, 1, constant_values=True).astype(np.uint8), cv2.DIST_L2, 3)[1:-1, 1:-1]
+    sel = tex.visible & ~near_edge & (deep > pt.BLEND_M * bake.ppm + 1)  # the photo fades out over its last 0.5 m
     baked_white = tex.rgb[..., 0] > 130
-    assert sel.sum() > 0.6 * tex.visible.size
+    assert sel.sum() > 0.4 * tex.visible.size
     assert (baked_white[sel] == _checker(xx, zz)[sel]).mean() > 0.98
     assert tex.rgb[..., 0][sel & _checker(xx, zz)].mean() == pytest.approx(WHITE, abs=8)
     assert tex.rgb[..., 0][sel & ~_checker(xx, zz)].mean() == pytest.approx(BLACK, abs=8)
 
 
-def test_walls_facing_away_are_not_visible_and_take_a_darker_donor():
+def _seam_spacing_m(tex, ppm):
+    """Distances (m) between the darker columns (vertical panel seams) of a wall texture."""
+    cols = tex.rgb.astype(float).mean(axis=(0, 2))
+    dark = np.nonzero(cols < 0.93 * np.median(cols))[0]
+    starts = dark[np.insert(np.diff(dark) > 2, 0, True)]  # a 2 px seam is one group of columns
+    return np.diff(starts) / ppm
+
+
+def test_walls_facing_away_get_a_procedural_facade_in_the_buildings_colour():
     prism, cam = _prism(), _camera()
     img, mask = _photo(cam)
     bake = pt.bake_textures(prism, cam, img, mask)
     south = bake.walls[_south(prism)]
-    others = [t for t in bake.walls if t.index != south.index]
+    base = south.rgb[south.visible].mean(axis=0)
+    assert bake.base_rgb == tuple(int(round(c)) for c in base)  # the mean colour of the visible wall texels
+    others = [w for w in bake.walls if w.index != south.index]
     assert len(others) == 3
-    for t in others:
-        assert not t.visible.any() and t.coverage == 0.0  # the camera is behind or edge-on to them
-        assert t.source == "donor" and t.donor == south.index
-        assert t.rgb.mean() / south.rgb.mean() == pytest.approx(pt.DARKEN, abs=0.03)  # darker, not blank
+    for w in others:
+        assert not w.visible.any() and w.coverage == 0.0 and w.source == "procedural"
+        assert w.rgb.reshape(-1, 3).mean(axis=0) == pytest.approx(base, rel=0.06)  # the building's own colour
+        assert w.rgb.std() / w.rgb.mean() < 0.12  # a plain facade with low noise, not the checkerboard
+        spacing = _seam_spacing_m(w, bake.ppm)
+        assert len(spacing) >= 2 and spacing.min() >= 1.4 and spacing.max() <= 2.1  # panel seams every 1.5-2 m
+        # a floor line every 3.5 m up from the ground (z = 3.5 and 7.0 on an 8 m wall)
+        rows = w.rgb.astype(float).mean(axis=(1, 2))
+        for z in (3.5, 7.0):
+            r = int(round((1 - z / prism.height_m) * len(rows)))
+            assert rows[r - 1 : r + 2].min() < 0.92 * np.median(rows)
+
+
+def test_unseen_walls_are_not_a_stretched_or_mirrored_copy_of_the_photo():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    bake = pt.bake_textures(prism, cam, img, mask)
+    south = bake.walls[_south(prism)].rgb.astype(float)
+    for w in bake.walls:
+        if w.source != "procedural":
+            continue
+        n = min(south.shape[1], w.rgb.shape[1])
+        for candidate in (south, south[:, ::-1], south[::-1]):  # the photographed wall, mirrored either way
+            c = candidate[:, :n, 0]
+            assert np.abs(w.rgb[:, :n, 0].astype(float) - c).mean() > 30  # nowhere near a copy (a checker is 25/235)
+
+
+def test_a_photographed_wall_gets_a_procedural_band_above_and_below_its_coverage_blended_in():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    rows = np.nonzero(mask.any(axis=1))[0]
+    mid = (rows[0] + rows[-1]) // 2
+    band = mask.copy()
+    band[: mid - 12] = False  # the photo covers only a strip: top and bottom of the wall are unseen
+    band[mid + 12 :] = False
+    bake = pt.bake_textures(prism, cam, img, band)
+    tex = bake.walls[_south(prism)]
+    assert tex.source in ("photo", "partial") and 0.15 < tex.coverage < 0.6
+    seen_rows = np.nonzero(tex.visible.any(axis=1))[0]
+    top_band = tex.rgb[: max(1, seen_rows[0] - int(1.0 * bake.ppm))]  # more than 1 m above the coverage
+    assert len(top_band) > 4
+    assert top_band.reshape(-1, 3).mean(axis=0) == pytest.approx(np.array(bake.base_rgb), rel=0.10)
+    assert top_band.std() / top_band.mean() < 0.15  # plain, where the checkerboard would be 0.8
+    # blended: no hard edge where the photographed strip ends (a checker square is 25 or 235; hard would be ~200)
+    col = tex.visible[seen_rows[0] : seen_rows[0] + 3].all(axis=0).nonzero()[0]
+    edge = tex.rgb[seen_rows[0] - 1 : seen_rows[0] + 2, col, 0].astype(float)
+    assert np.abs(np.diff(edge, axis=0)).max() < 60
 
 
 def test_a_wall_needs_a_view_to_be_baked_at_all():
     prism, cam = _prism(), _camera()
     img, _ = _photo(cam)
     bake = pt.bake_textures(prism, cam, img, np.zeros((H, W), bool))  # nothing is "building"
-    assert all(t.source == "neutral" and not t.visible.any() for t in bake.walls)
-    assert len({tuple(t.rgb.reshape(-1, 3)[0]) for t in bake.walls}) == 1  # one neutral colour, no garbage
+    assert all(w.source == "procedural" and not w.visible.any() for w in bake.walls)
+    assert bake.base_rgb == pt.NEUTRAL_RGB  # no wall texels seen: the neutral colour, not garbage from the image
+    for w in bake.walls:
+        assert w.rgb.reshape(-1, 3).mean(axis=0) == pytest.approx(pt.NEUTRAL_RGB, rel=0.06)
+
+
+def test_the_scorched_facade_adds_rust_streaks_and_the_photo_one_does_not():
+    args = (400, 414, 20.0, 20.7, (140, 130, 120))
+    photo = pt.procedural_facade(*args, "photo", seed=[1, 2, 3]).astype(float)
+    scorched = pt.procedural_facade(*args, "scorched", seed=[1, 2, 3]).astype(float)
+    assert photo.reshape(-1, 3).mean(axis=0) == pytest.approx((140, 130, 120), rel=0.03)
+    rust = lambda im: (im[..., 0] - im[..., 2]).mean()  # noqa: E731
+    assert rust(scorched) > rust(photo) + 2  # streaks tint it orange-brown
+    assert (scorched.std(axis=0) > 0).all() and scorched.std() > photo.std()  # more structure than the plain facade
+    assert np.array_equal(photo, pt.procedural_facade(*args, "photo", seed=[1, 2, 3]).astype(float))  # deterministic
+
+
+# ---- roof --------------------------------------------------------------------------------------------------
+
+
+def test_the_roof_textures_are_dark_seamless_and_have_the_described_structure():
+    walls = (140, 130, 120)
+    photo, scorched = pt.roof_texture("photo", walls, 1), pt.roof_texture("scorched", walls, 1)
+    assert photo.shape == scorched.shape == (512, 512, 3)
+    for tile in (photo, scorched):
+        assert pt._luma(tile).mean() < 0.6 * float(pt._luma(walls)) and pt._luma(tile).mean() <= pt.ROOF_MAX_LUMA + 1e-3
+    # photo: a faint panel grid every 2 m (128 px at 64 px/m): darker rows there, but only slightly
+    rows = photo.astype(float).mean(axis=(1, 2))
+    on_grid = rows[[0, 1, 128, 129, 256, 257, 384, 385]].mean()
+    assert 0.75 * np.median(rows) < on_grid < 0.97 * np.median(rows)
+    # scorched: riveted plates 2 m (128 px) tall: dark joints between rows, and rust-orange overall
+    rows_s = scorched.astype(float).mean(axis=(1, 2))
+    assert rows_s[[127, 128, 255, 256, 383, 384]].mean() < 0.85 * np.median(rows_s)
+    assert (scorched[..., 0].astype(float) - scorched[..., 2]).mean() > (photo[..., 0].astype(float) - photo[..., 2]).mean() + 5
+
+
+def test_the_tiling_noise_is_periodic():
+    n = pt._wrap_noise(np.random.default_rng(3), 256, 6.0)
+    assert n.std() == pytest.approx(1.0, abs=1e-3)
+    across = np.corrcoef(n[:, 0], n[:, -1])[0, 1]  # the last column is the first column's neighbour
+    within = np.corrcoef(n[:, 100], n[:, 101])[0, 1]
+    assert across == pytest.approx(within, abs=0.05) and across > 0.8
+    assert np.corrcoef(n[0], n[-1])[0, 1] == pytest.approx(np.corrcoef(n[100], n[101])[0, 1], abs=0.05)
+
+
+def test_the_roof_stays_darker_than_walls_even_when_the_walls_are_dark():
+    dark_walls = (60, 55, 50)  # a scorched building
+    for style in ("photo", "scorched"):
+        tile = pt.roof_texture(style, dark_walls, 1)
+        assert pt._luma(tile).mean() <= 0.6 * float(pt._luma(dark_walls)) + 1e-3
+
+
+def test_the_roof_is_a_textured_tiled_mesh_in_the_glb(tmp_path):
+    prism, bake, gltf = _glb(tmp_path)
+    prim = gltf.meshes[{n.name: n for n in gltf.nodes}["roof"].mesh].primitives[0]
+    uv, pos = _accessor(gltf, prim.attributes.TEXCOORD_0), _accessor(gltf, prim.attributes.POSITION)
+    assert uv == pytest.approx(pos[:, :2] / pt.ROOF_TILE_M) or uv[:, 0] == pytest.approx(pos[:, 0] / pt.ROOF_TILE_M)
+    assert gltf.materials[prim.material].pbrMetallicRoughness.baseColorTexture is not None
+    assert len(gltf.images) == 2  # the wall atlas and the roof tile
 
 
 def test_texels_behind_a_hole_in_the_mask_are_not_visible():
@@ -195,9 +308,8 @@ def test_glb_is_in_enu_with_the_walls_and_roof_materials(tmp_path):
     wall_mat, roof_mat = gltf.materials[walls_prim.material], gltf.materials[roof_prim.material]
     wp, rp = wall_mat.pbrMetallicRoughness, roof_mat.pbrMetallicRoughness
     assert (wp.metallicFactor, wp.roughnessFactor) == pytest.approx((0.4, 0.75))
-    assert wp.baseColorTexture is not None and len(gltf.images) == 1
-    assert rp.baseColorTexture is None and rp.baseColorFactor[:3] == pytest.approx(pt.ROOF_RGBA[:3], abs=4e-3)  # 8-bit
-    assert max(rp.baseColorFactor[:3]) < 0.25  # dark
+    assert wp.baseColorTexture is not None and rp.baseColorTexture is not None and len(gltf.images) == 2
+    assert (rp.metallicFactor, rp.roughnessFactor) == pytest.approx((0.6, 0.55))
     assert "ENU" in by_name["walls"].extras["frame"] and by_name["roof"].extras["source_image"] == "synthetic.png"
 
 
@@ -310,11 +422,15 @@ def test_an_edit_bakes_no_fringe_only_inside_both_masks():
     prism, cam = _prism(), _camera()
     edit, original_mask, edit_mask = _fringed_edit(cam)
     south = _south(prism)
-    unmasked = pt.bake_textures(prism, cam, edit, original_mask).walls[south]  # the original mask alone
-    both = pt.bake_textures(prism, cam, edit, original_mask, edit_mask=edit_mask).walls[south]
-    assert (unmasked.rgb[unmasked.visible] == 255).any()  # the fringe leaks in without the edit's mask
-    assert not (both.rgb[both.visible] == 255).any()  # ... and cannot with it
-    assert both.visible.sum() < unmasked.visible.sum() and both.coverage > 0.6  # the border ring is now filled
+    _, sizes = pt.choose_ppm(prism)
+    wall, size = prism.walls[south], sizes[south]
+    both_mask = original_mask & edit_mask
+    unmasked = pt.bake_wall(prism, cam, wall, size, edit, pt._erode(original_mask))  # the original mask alone
+    masked = pt.bake_wall(prism, cam, wall, size, edit, pt._erode(both_mask, pt.edit_erode_size(pt._mask_width(both_mask))))
+    assert (unmasked[0][unmasked[1]] == 255).any()  # the fringe leaks in without the edit's mask
+    assert not (masked[0][masked[1]] == 255).any()  # ... and cannot with it
+    final = pt.bake_textures(prism, cam, edit, original_mask, edit_mask=edit_mask).walls[south]
+    assert final.visible.sum() < unmasked[1].sum() and final.coverage > 0.6  # the border ring is now filled instead
 
 
 def test_a_texel_outside_the_edits_mask_is_never_visible():

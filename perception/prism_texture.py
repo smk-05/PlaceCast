@@ -26,20 +26,22 @@ A texel is VISIBLE only if
     texel near the boundary (within HALO_BAND_FRAC of the width) whose baked colour is light and low-saturation (the
     edits carry a beige halo) is not visible either. Everything else goes to the fill step.
 
-Texels the camera cannot see are filled, never left blank:
-  * a wall with coverage >= STRONG_COVERAGE keeps its visible texels; small holes are cv2.inpaint'ed and large ones
-    filled from a low-resolution inpaint;
-  * a wall the photo barely shows (coverage < STRONG_COVERAGE) takes a DONOR: the well-covered wall whose outward
-    normal is most similar, mirror-tiled along its length and darkened by DARKEN. Its own visible texels are kept if
-    coverage >= KEEP_COVERAGE, otherwise it is entirely donor;
-  * with no well-covered wall at all, a neutral colour from the visible texels.
-`WallTexture.source` records which of these happened to each wall ("photo", "partial", "donor", "neutral").
-The roof is a dark weathered-steel material, not a photo texture (it is not visible from the ground).
+Texels the camera cannot see are filled, never left blank and NEVER stretched or mirrored from the photo:
+  * a small gap inside the photographed area is cv2.inpaint'ed;
+  * everything else unseen (a whole wall the photo does not show, and any band above, below or beside a photographed
+    wall's coverage) is a PROCEDURAL facade in the mean colour of the building's visible wall texels (per variant):
+    vertical panel seams every 1.5-2 m, a floor line every 3.5 m, low noise, and for the scorched variant rust
+    streaks. The photographed area fades into it over BLEND_M (0.5 m), so there is no hard edge.
+`WallTexture.source` records "photo" (coverage >= STRONG_COVERAGE), "partial" (>= KEEP_COVERAGE) or "procedural"
+(a wall whose own visible texels are discarded as too few).
+The roof is procedural too (not visible from the ground): a dark membrane with a faint panel grid for the photo
+variant; riveted rusty steel plates about 2 x 4 m with soot for the scorched one; always darker than the walls.
 
 glb. Vertices are ENU metres (x east, y north, z up): the frame web/src/main.js uses for the opening markers, with
 the record's origin and ground. That is not glTF's Y-up convention on purpose: Cesium is told upAxis Z / forwardAxis X,
 exactly as for the generated-mesh path, so it applies no axis correction and modelMatrix = enuToFixed places the model.
-Walls: PBR, metallic 0.4, roughness 0.75, one atlas texture. Roof: metallic 0.6, roughness 0.55, no texture.
+Walls: PBR, metallic 0.4, roughness 0.75, one atlas texture. Roof: metallic 0.6, roughness 0.55, one tiled texture
+(UV = ENU x, y over ROOF_TILE_M metres, glTF's default repeat wrapping).
 
 Usage: python perception/prism_texture.py RUN_DIR PHOTO MASK [--scorched EDIT.png [--edit-mask MASK.png]] [--force]
 """
@@ -74,10 +76,20 @@ EPS_M = 0.05  # an obstruction closer than this to the texel is the wall itself,
 STRONG_COVERAGE = 0.4
 KEEP_COVERAGE = 0.15
 SMALL_HOLE_PX = 1500
-DARKEN = 0.85
 NEUTRAL_RGB = (128, 126, 120)
+SEED = 20260919
+BLEND_M = 0.5  # the photographed area fades into the procedural facade over this distance
+FACADE_SEAM_M = (1.5, 2.0)  # vertical panel seams
+FLOOR_PITCH_M = 3.5  # a floor line every this many metres up from the ground
+NOISE_SIGMA = 0.035
+PANEL_TONE_SIGMA = 0.025
+SEAM_DARKEN, FLOOR_LINE_DARKEN = 0.84, 0.80
+RUST_RGB = (150, 72, 32)
+ROOF_TILE_M, ROOF_PPM = 8.0, 64
+ROOF_MEMBRANE_RGB = (56.0, 58.0, 62.0)
+ROOF_MAX_LUMA = 0.20  # the roof's mean luminance is at most this ...
+ROOF_WALL_RATIO = 0.6  # ... and at most this fraction of the walls'
 METALLIC_WALL, ROUGHNESS_WALL = 0.4, 0.75
-ROOF_RGBA = (0.16, 0.17, 0.19, 1.0)
 METALLIC_ROOF, ROUGHNESS_ROOF = 0.6, 0.55
 NEAR_M = 0.5
 
@@ -90,8 +102,7 @@ class WallTexture:
     rgb: np.ndarray  # (h, w, 3) uint8, row 0 is the TOP of the wall, column 0 is at p0
     visible: np.ndarray  # (h, w) bool: baked from the photo (False = filled)
     coverage: float
-    source: str = "photo"  # photo | partial | donor | neutral
-    donor: int = -1
+    source: str = "photo"  # photo | partial | procedural
 
 
 @dataclass
@@ -101,11 +112,12 @@ class Bake:
     atlas: np.ndarray = None  # (A_h, A_w, 3) uint8
     atlas_visible: np.ndarray = None  # (A_h, A_w) bool
     atlas_used: np.ndarray = None  # (A_h, A_w) bool: inside some wall's rectangle
+    roof_tile: np.ndarray = None  # (S, S, 3) uint8, ROOF_TILE_M metres square
+    base_rgb: tuple = ()  # the mean colour of the visible wall texels: what the procedural facade is built from
     rects: list = field(default_factory=list)  # per wall (x, y, w, h) in the atlas, excluding the PAD ring
 
     def stats(self):
-        return [{"wall": t.index, "coverage": round(t.coverage, 3), "source": t.source,
-                 **({"donor": t.donor} if t.donor >= 0 else {})} for t in self.walls]
+        return [{"wall": t.index, "coverage": round(t.coverage, 3), "source": t.source} for t in self.walls]
 
 
 # ------------------------------------------------------------------- layout
@@ -251,6 +263,7 @@ def bake_wall(prism, camera, wall, size, image, mask_eroded, halo_zone=None):
 
 
 def _inpaint_small(rgb, hole):
+    """cv2.inpaint the SMALL connected components of `hole`. -> (rgb, the components left unfilled)."""
     count, labels, stats, _ = cv2.connectedComponentsWithStats(hole.astype(np.uint8), connectivity=8)
     small = np.zeros(hole.shape, bool)
     for i in range(1, count):
@@ -261,66 +274,179 @@ def _inpaint_small(rgb, hole):
     return rgb, hole & ~small
 
 
-def _inpaint_lowres(rgb, hole, scale=4):
-    """Fill large holes from a downscaled inpaint: blurred, but it borrows the wall's own colour."""
-    if not hole.any():
-        return rgb
-    h, w = hole.shape
-    sh, sw = max(1, h // scale), max(1, w // scale)
-    valid = (~hole).astype(np.float32)
-    total = cv2.resize(rgb.astype(np.float32) * valid[..., None], (sw, sh), interpolation=cv2.INTER_AREA)
-    weight = cv2.resize(valid, (sw, sh), interpolation=cv2.INTER_AREA)
-    small = (total / np.maximum(weight[..., None], 1e-6)).clip(0, 255).astype(np.uint8)
-    small = cv2.inpaint(small, (weight < 0.5).astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
-    up = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
-    out = rgb.copy()
-    out[hole] = up[hole]
-    return out
+def _interior_holes(visible):
+    """Unseen texels that have a seen texel above AND below them in their column: gaps INSIDE the photographed area
+    (a lamp post, a branch). What lies above the top or below the bottom of a column's coverage is a band, not a
+    hole, and so are columns with no coverage at all."""
+    if not visible.any():
+        return np.zeros_like(visible)
+    has = visible.any(axis=0)
+    first = np.where(has, visible.argmax(axis=0), visible.shape[0])
+    last = np.where(has, visible.shape[0] - 1 - visible[::-1].argmax(axis=0), -1)
+    rows = np.arange(visible.shape[0])[:, None]
+    return (rows >= first[None]) & (rows <= last[None]) & ~visible
 
 
-def _mirror_tile(rgb, width):
-    """`rgb` repeated (alternately mirrored, so there is no seam) to `width` columns, centred on the original."""
-    h, w, _ = rgb.shape
-    reps = math.ceil(width / w) + 2
-    tiles = [rgb if i % 2 == 0 else rgb[:, ::-1] for i in range(reps)]
-    wide = np.concatenate(tiles, axis=1)
-    start = (wide.shape[1] - width) // 2
-    return wide[:, start : start + width]
+def _photo_weight(photo_mask, ppm):
+    """1 deep inside the photographed area, falling smoothly to 0 over BLEND_M at its boundary with unseen texels.
+    The outer border of the texture is not a boundary (the neighbouring wall is not a hole)."""
+    if not photo_mask.any():
+        return np.zeros(photo_mask.shape, np.float32)
+    padded = cv2.copyMakeBorder(photo_mask.astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=1)
+    dist = cv2.distanceTransform(padded, cv2.DIST_L2, 3)[1:-1, 1:-1]
+    w = np.clip(dist / (BLEND_M * ppm), 0.0, 1.0)
+    return (w * w * (3.0 - 2.0 * w) * photo_mask).astype(np.float32)
 
 
-def _darken(rgb):
-    return (rgb.astype(np.float32) * DARKEN).clip(0, 255).astype(np.uint8)
+def procedural_facade(w_px, h_px, ppm, height_m, base_rgb, style, seed):
+    """A plain building facade in the building's own colour: (h, w, 3) uint8 for a wall texture, row 0 at the top.
+
+    `base_rgb` is the mean colour of the building's visible wall texels. On it: vertical panel seams every 1.5-2 m
+    (jittered), each panel a touch lighter or darker; a floor line every 3.5 m up from the ground; low noise. The
+    'scorched' style adds rust streaks running down from the seams and floor lines. Deterministic in `seed`."""
+    rng = np.random.default_rng(seed)
+    img = np.empty((h_px, w_px, 3), np.float32)
+    img[:] = np.asarray(base_rgb, np.float32)
+
+    edges, x = [0], 0.0
+    while True:
+        x += rng.uniform(*FACADE_SEAM_M) * ppm
+        if x >= w_px - 0.5 * ppm:
+            break
+        edges.append(int(round(x)))
+    edges.append(w_px)
+    for a, b in zip(edges[:-1], edges[1:]):
+        img[:, a:b] *= 1.0 + rng.normal(0.0, PANEL_TONE_SIGMA)
+    for e in edges[1:-1]:
+        img[:, max(0, e - 1) : e + 1] *= SEAM_DARKEN
+    floor_rows = []
+    z = FLOOR_PITCH_M
+    while z < height_m - 0.3:
+        r = int(round((1.0 - z / height_m) * h_px))
+        floor_rows.append(r)
+        img[max(0, r - 1) : r + 2] *= FLOOR_LINE_DARKEN
+        z += FLOOR_PITCH_M
+
+    noise = cv2.GaussianBlur(rng.normal(0.0, 1.0, (h_px, w_px)).astype(np.float32), (0, 0), 0.8)
+    img *= 1.0 + NOISE_SIGMA * (noise / max(noise.std(), 1e-6))[..., None]
+
+    if style == "scorched":
+        alpha = np.zeros((h_px, w_px), np.float32)
+        starts = [(e, 0) for e in edges[1:-1]] + [(int(rng.integers(0, w_px)), r) for r in floor_rows]
+        starts += [(int(rng.integers(0, w_px)), int(rng.integers(0, max(1, int(h_px * 0.7)))))
+                   for _ in range(max(1, int(w_px / ppm * 1.5)))]
+        for x0, r0 in starts:
+            length = int(rng.uniform(1.5, 6.0) * ppm)
+            r1 = min(h_px, r0 + length)
+            if r1 <= r0:
+                continue
+            fade = np.linspace(1.0, 0.0, r1 - r0, dtype=np.float32) ** 1.5 * rng.uniform(0.3, 0.75)
+            width = int(rng.integers(4, 13))
+            sl = alpha[r0:r1, x0 : x0 + width]
+            alpha[r0:r1, x0 : x0 + width] = np.maximum(sl, fade[:, None])
+        alpha = cv2.GaussianBlur(alpha, (0, 0), 1.0)[..., None]
+        img = img * (1.0 - alpha) + np.asarray(RUST_RGB, np.float32) * alpha
+    return img.clip(0, 255).astype(np.uint8)
 
 
-def fill_walls(prism, raw):
-    """raw: list of (rgb, visible). -> list of WallTexture with every texel filled. See the module docstring."""
-    out = []
-    for i, (rgb, vis) in enumerate(raw):
-        out.append(WallTexture(i, rgb.copy(), vis.copy(), float(vis.mean())))
-    strong = [t for t in out if t.coverage >= STRONG_COVERAGE]
-    for t in strong:
-        rgb, big = _inpaint_small(t.rgb, ~t.visible)
-        t.rgb, t.source = _inpaint_lowres(rgb, big & ~t.visible), "photo"
-    seen = np.concatenate([t.rgb[t.visible] for t in out if t.visible.any()] or [np.zeros((0, 3), np.uint8)])
-    neutral = np.median(seen, axis=0) if len(seen) else np.array(NEUTRAL_RGB, float)
+def fill_walls(prism, raw, ppm, style="photo"):
+    """raw: list of (rgb, visible). -> (list of WallTexture with every texel filled, the building's mean colour).
+
+    Nothing is ever stretched or mirrored from the photo. What the camera did not see is a PROCEDURAL facade
+    (`procedural_facade`) in the mean colour of the building's visible wall texels: a whole wall the photo does not
+    show, and any band above or below (or beside) a photographed wall's coverage. The photographed area fades into it
+    over BLEND_M, so there is no hard edge. Small gaps inside the photographed area are cv2.inpaint'ed instead."""
+    out = [WallTexture(i, rgb.copy(), vis.copy(), float(vis.mean())) for i, (rgb, vis) in enumerate(raw)]
+    kept = [t for t in out if t.coverage >= KEEP_COVERAGE]
+    seen = [t.rgb[t.visible] for t in kept if t.visible.any()]
+    base = np.concatenate(seen).mean(axis=0) if seen else np.array(NEUTRAL_RGB, np.float32)
+    style_id = {"photo": 0, "scorched": 1}.get(style, 2)
     for t in out:
-        if t.coverage >= STRONG_COVERAGE:
-            continue
-        keep = t.visible if t.coverage >= KEEP_COVERAGE else np.zeros_like(t.visible)
-        donors = [d for d in strong if d.index != t.index]
-        if donors:
-            n = np.asarray(prism.walls[t.index]["normal"])
-            best = max(donors, key=lambda d: (float(np.dot(n, prism.walls[d.index]["normal"])), d.coverage))
-            fill, t.donor, t.source = _darken(_mirror_tile(best.rgb, t.rgb.shape[1])), best.index, "donor"
-        else:
-            fill = np.empty_like(t.rgb)
-            fill[:] = _darken(np.asarray(neutral, np.uint8)[None, None])[0, 0]
-            t.source = "neutral"
-        t.rgb = np.where(keep[..., None], t.rgb, fill)
-        if keep.any():
-            t.source = "partial"
-        t.visible = keep
-    return out
+        vis = t.visible if t.coverage >= KEEP_COVERAGE else np.zeros_like(t.visible)
+        holes = _interior_holes(vis)
+        rgb, unfilled = _inpaint_small(t.rgb, holes)
+        photo = vis | (holes & ~unfilled)
+        h_px, w_px = vis.shape
+        proc = procedural_facade(w_px, h_px, ppm, prism.height_m, base, style, seed=[SEED, t.index, style_id])
+        w = _photo_weight(photo, ppm)[..., None]
+        t.rgb = (rgb.astype(np.float32) * w + proc.astype(np.float32) * (1.0 - w)).round().astype(np.uint8)
+        t.visible = vis
+        t.source = "photo" if t.coverage >= STRONG_COVERAGE else "partial" if t.coverage >= KEEP_COVERAGE else "procedural"
+    return out, base
+
+
+# ------------------------------------------------------------ procedural roof
+
+
+def _wrap_noise(rng, size, sigma):
+    """Unit-variance noise that tiles seamlessly (Gaussian-filtered in the Fourier domain)."""
+    freq = np.fft.fftfreq(size)
+    gauss = np.exp(-2.0 * (np.pi * sigma) ** 2 * (freq[:, None] ** 2 + freq[None, :] ** 2))  # periodic by construction
+    n = np.fft.ifft2(np.fft.fft2(rng.normal(0.0, 1.0, (size, size))) * gauss).real.astype(np.float32)
+    return n / max(float(n.std()), 1e-6)
+
+
+def _luma(rgb):
+    rgb = np.asarray(rgb, np.float32)
+    return (0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]) / 255.0
+
+
+def roof_texture(style, wall_rgb, seed=0):
+    """A seamless ROOF_TILE_M x ROOF_TILE_M tile, (S, S, 3) uint8, repeated across the roof.
+
+    photo:    dark grey membrane, a faint panel grid (every 2 m), noise.
+    scorched: riveted steel plates about 2 x 4 m (staggered rows), rust-orange variation from plate to plate and
+              within each, soot, noise.
+    Scaled so its mean luminance stays below both ROOF_MAX_LUMA and ROOF_WALL_RATIO x the walls' (`wall_rgb`)."""
+    rng = np.random.default_rng([seed, {"photo": 0, "scorched": 1}.get(style, 2)])
+    s = int(ROOF_TILE_M * ROOF_PPM)
+    yy, xx = np.mgrid[0:s, 0:s]
+    fine = _wrap_noise(rng, s, 1.2)
+    broad = _wrap_noise(rng, s, 40.0)
+
+    if style == "scorched":
+        steel, rust = np.array([72.0, 66.0, 62.0]), np.array(RUST_RGB, np.float32)
+        plate_h, plate_w = int(2.0 * ROOF_PPM), int(4.0 * ROOF_PPM)
+        row = yy // plate_h
+        col = ((xx + (row % 2) * (plate_w // 2)) % s) // plate_w  # alternate rows stagger by half a plate
+        n_rows, n_cols = s // plate_h, s // plate_w
+        amount = rng.uniform(0.0, 0.6, (n_rows, n_cols))[row, col]
+        mix = np.clip(amount + 0.12 * broad, 0.0, 0.85)[..., None]  # rust also varies within a plate
+        img = steel * (1.0 - mix) + rust * mix
+        # seams (wrapped, so the tile repeats): plate joints run along the row boundaries and the column joints
+        seam = np.zeros((s, s), np.float32)
+        for r in range(n_rows):
+            seam[[(r * plate_h + d) % s for d in (-1, 0, 1)], :] = 1.0
+            off = (r % 2) * (plate_w // 2)
+            for c in range(n_cols):
+                x = (c * plate_w + off) % s
+                seam[r * plate_h : (r + 1) * plate_h, [(x + d) % s for d in (-1, 0, 1)]] = 1.0
+        img *= (1.0 - 0.45 * seam)[..., None]
+        rivets = np.zeros((s, s), np.uint8)
+        step, inset = ROOF_PPM // 2, 8  # a rivet every 0.5 m, set in from each joint
+        for r in range(n_rows):
+            off = (r % 2) * (plate_w // 2)
+            for y in (r * plate_h + inset, (r + 1) * plate_h - inset):
+                for x in range(off + inset, off + s, step):
+                    cv2.circle(rivets, (x % s, y % s), 3, 255, -1)
+        rivets = cv2.GaussianBlur(rivets, (0, 0), 0.8).astype(np.float32) / 255.0
+        img *= (1.0 + 0.35 * rivets)[..., None]
+        soot = np.clip(0.75 + 0.2 * _wrap_noise(rng, s, 25.0) - 0.25 * np.clip(_wrap_noise(rng, s, 6.0), 0, None), 0.35, 1.0)
+        img *= soot[..., None]
+        img *= (1.0 + 0.05 * fine)[..., None]
+    else:
+        img = np.empty((s, s, 3), np.float32)
+        img[:] = ROOF_MEMBRANE_RGB
+        grid = ROOF_PPM * 2  # a panel grid every 2 m, faint
+        lines = ((xx % grid) < 2) | ((yy % grid) < 2)
+        img *= np.where(lines, 0.90, 1.0)[..., None]
+        img *= (1.0 + 0.05 * fine + 0.06 * broad)[..., None]
+
+    target = min(ROOF_MAX_LUMA, ROOF_WALL_RATIO * float(_luma(wall_rgb)))
+    current = float(_luma(img).mean())
+    if current > target > 0:
+        img *= target / current
+    return img.clip(0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------- atlas
@@ -356,13 +482,15 @@ def edit_erode_size(width_px):
     return size + 1 - size % 2
 
 
-def bake_textures(prism, camera, image, mask, ppm=PPM, edit_mask=None, halo_band_frac=HALO_BAND_FRAC):
+def bake_textures(prism, camera, image, mask, ppm=PPM, edit_mask=None, halo_band_frac=HALO_BAND_FRAC,
+                  style="photo"):
     """Bake `image` (H, W, 3 uint8 RGB, the same framing as the photo the camera was fitted to) onto every wall.
 
     `mask` is the ORIGINAL photo's building mask at the PHOTO's resolution (bool, camera.height x camera.width);
     `image` may be a different resolution (a generated edit): pixel coordinates are scaled. For an edit, pass
     `edit_mask`, the edit's own building mask at the edit's resolution: the two are intersected at photo resolution,
-    eroded by ~1% of the building width, and halo-coloured texels near the boundary are dropped (module docstring)."""
+    eroded by ~1% of the building width, and halo-coloured texels near the boundary are dropped (module docstring).
+    `style` ("photo" or "scorched") picks the procedural facade and roof that fill what the camera did not see."""
     mask = np.asarray(mask)
     if mask.shape != (camera.height, camera.width):
         raise ValueError(f"mask is {mask.shape}, camera expects {(camera.height, camera.width)}")
@@ -382,15 +510,18 @@ def bake_textures(prism, camera, image, mask, ppm=PPM, edit_mask=None, halo_band
         halo_zone = both & (cv2.distanceTransform(both.astype(np.uint8), cv2.DIST_L2, 3) < band)
     ppm, sizes = choose_ppm(prism, ppm)
     raw = [bake_wall(prism, camera, wall, size, image, eroded, halo_zone) for wall, size in zip(prism.walls, sizes)]
-    walls = fill_walls(prism, raw)
+    walls, base = fill_walls(prism, raw, ppm, style)
     atlas, visible, used, rects = build_atlas(prism, walls, ppm, sizes)
-    return Bake(walls, ppm, atlas, visible, used, rects)
+    return Bake(walls, ppm, atlas=atlas, atlas_visible=visible, atlas_used=used, rects=rects,
+                roof_tile=roof_texture(style, base, SEED), base_rgb=tuple(int(round(c)) for c in base))
 
 
 def write_previews(bake, prefix):
-    """<prefix>_atlas.png (what is baked) and <prefix>_atlas_visibility.png (green: from the photo, red: filled)."""
+    """<prefix>_atlas.png (what is baked), <prefix>_atlas_visibility.png (green: from the photo, red: filled) and
+    <prefix>_roof.png (one tile of the roof texture)."""
     prefix = str(prefix)
     Image.fromarray(bake.atlas).save(prefix + "_atlas.png")
+    Image.fromarray(bake.roof_tile).save(prefix + "_roof.png")
     tint = bake.atlas.astype(np.float32)
     real = bake.atlas_visible[..., None]
     tint = np.where(real, tint * 0.65 + np.array([0, 90, 0]), tint * 0.5 + np.array([120, 0, 0]))
@@ -402,20 +533,21 @@ def write_previews(bake, prefix):
 # ------------------------------------------------------------------------ glb
 
 
-def _roof_mesh(prism):
+def _roof_mesh(prism, tile):
+    """The roof, triangulated, with a tiled texture: UV = (x, y) / ROOF_TILE_M, and glTF wraps by repeating."""
     verts, faces = [], []
     for poly in prism.polygons:
         v2, f = trimesh.creation.triangulate_polygon(poly)
-        f = np.asarray(f)
-        for tri in f:  # keep every triangle counter-clockwise seen from above
+        for tri in np.asarray(f):  # keep every triangle counter-clockwise seen from above
             a, b, c = v2[tri]
             if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) < 0:
                 tri = tri[::-1]
             verts.append(np.column_stack([v2[tri], np.full(3, prism.height_m)]))
             faces.append(np.arange(3) + 3 * len(faces))
-    roof = trimesh.Trimesh(np.concatenate(verts), np.array(faces), process=False)
-    roof.visual = trimesh.visual.TextureVisuals(material=trimesh.visual.material.PBRMaterial(
-        baseColorFactor=ROOF_RGBA, metallicFactor=METALLIC_ROOF, roughnessFactor=ROUGHNESS_ROOF))
+    verts = np.concatenate(verts)
+    roof = trimesh.Trimesh(verts, np.array(faces), process=False)
+    roof.visual = trimesh.visual.TextureVisuals(uv=verts[:, :2] / ROOF_TILE_M, material=trimesh.visual.material.PBRMaterial(
+        baseColorTexture=Image.fromarray(tile), metallicFactor=METALLIC_ROOF, roughnessFactor=ROUGHNESS_ROOF))
     return roof
 
 
@@ -443,7 +575,7 @@ def build_glb(prism, bake, out_glb, source=None):
         baseColorTexture=Image.fromarray(bake.atlas), metallicFactor=METALLIC_WALL, roughnessFactor=ROUGHNESS_WALL))
     scene = trimesh.Scene()
     scene.add_geometry(walls, node_name="walls", geom_name="walls")
-    scene.add_geometry(_roof_mesh(prism), node_name="roof", geom_name="roof")
+    scene.add_geometry(_roof_mesh(prism, bake.roof_tile), node_name="roof", geom_name="roof")
     out_glb = Path(out_glb)
     out_glb.write_bytes(scene.export(file_type="glb"))
 
@@ -507,12 +639,12 @@ def bake_record(run_dir, photo, mask, scorched=None, force=False, scorched_mask=
             except Exception as exc:  # noqa: BLE001 - no segmenter / no weights: skip, do not bake unmasked
                 stats[key] = {"skipped": f"no edit mask ({type(exc).__name__}: {exc})"}
                 continue
-        bake = bake_textures(prism, camera, _load_image(image_path), mask_arr, edit_mask=edit_mask)
+        bake = bake_textures(prism, camera, _load_image(image_path), mask_arr, edit_mask=edit_mask, style=key)
         glb = build_glb(prism, bake, run_dir / f"prism_{key}.glb", source=Path(image_path).name)
         write_previews(bake, run_dir / f"prism_{key}")
         listed[key] = glb.name
         stats[key] = {"px_per_m": round(bake.ppm, 2), "atlas": list(bake.atlas.shape[1::-1]), "walls": bake.stats(),
-                      "edit_mask": edit_mask is not None}
+                      "edit_mask": edit_mask is not None, "base_rgb": list(bake.base_rgb)}
     record["textured_glbs"] = listed
     record["texture_bake"] = stats
     record_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
