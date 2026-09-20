@@ -17,6 +17,8 @@ free.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from scipy import ndimage
 from shapely.geometry import Polygon
@@ -292,6 +294,18 @@ def ground_outline(vertices_canonical: np.ndarray,
     slab = vertices_canonical[m] if m.sum() >= 50 else vertices_canonical
 
     xy = slab[:, :2]
+    # Rasterise in the PLAN'S OWN frame, not the model's. The occupancy grid is
+    # axis-aligned, so the same building arriving rotated by 37 degrees
+    # discretises differently and yields a different outline: re-solving a
+    # scrambled copy of the NCB mesh agreed with the original only to IoU 0.69.
+    # Aligning the grid with the plan's OMBB makes extraction rotation-
+    # invariant, and as a bonus a rectilinear building's walls then land along
+    # the grid instead of stair-stepping across it. The contour is rotated back
+    # at the end (`to_model`), so the caller still gets model coordinates.
+    grid_angle = float(compute_ombb(xy).angle) if len(xy) >= 3 else 0.0
+    c, s = math.cos(-grid_angle), math.sin(-grid_angle)
+    to_grid = np.array([[c, -s], [s, c]])
+    xy = xy @ to_grid.T
     # Robust size: ignore the extreme 1% so one stray vertex cannot set the scale.
     size = float(max(np.ptp(np.percentile(xy, [1, 99], axis=0), axis=0).max(), 1e-9))
     # Cell size must track POINT SPACING, not just mesh size. With a fixed
@@ -338,14 +352,17 @@ def ground_outline(vertices_canonical: np.ndarray,
     padded = np.pad(filled.astype(float), 1)
     contours = measure.find_contours(padded, 0.5)
     if not contours:
-        # Degenerate: fall back to the convex hull of the slab.
+        # Degenerate: fall back to the convex hull of the slab, rotated back
+        # out of the grid frame like any other contour.
         hull = Polygon(xy).convex_hull
-        return np.asarray(hull.exterior.coords)[:-1], ()
+        return np.asarray(hull.exterior.coords)[:-1] @ to_grid, ()
 
     def to_model(c: np.ndarray) -> np.ndarray:
-        # find_contours returns (row, col) on the padded grid
-        return np.stack([(c[:, 1] - 1) * pixel_m + lo[0],
-                         (c[:, 0] - 1) * pixel_m + lo[1]], axis=1)
+        # find_contours returns (row, col) on the padded grid; undo the padding
+        # and the cell size, then the grid rotation applied above.
+        pts = np.stack([(c[:, 1] - 1) * pixel_m + lo[0],
+                        (c[:, 0] - 1) * pixel_m + lo[1]], axis=1)
+        return pts @ to_grid          # inverse: to_grid is orthonormal
 
     rings = sorted((to_model(c) for c in contours),
                    key=lambda r: Polygon(r).area if len(r) > 3 else 0.0,
