@@ -218,6 +218,7 @@ ANISO_EPS = 0.15        # spec 6.9 hard cap: |log(sx/sy)| <= log(1+eps)
 
 def iou_refine(fp: Footprint, mo: MeshOutline, params: dict,
                *, allow_anisotropy: bool = False,
+               aniso_cap: float | None = None,
                max_evals: int = 400) -> dict:
     """Derived-free local maximisation of polygon IoU. Spec 6.8, 6.9.
 
@@ -229,9 +230,22 @@ def iou_refine(fp: Footprint, mo: MeshOutline, params: dict,
     uniform scaling; when enabled, spec 6.9's squared-log-ratio penalty applies
     — symmetric under swapping the axes, scale-invariant, and zero exactly at
     isotropy.
+
+    `aniso_cap` overrides that hard cap, as |log(sx/sy)|. It exists for CONFORM
+    runs (pipeline.py --conform), which deliberately stretch a generated mesh
+    onto the footprint: single-view generators return a shallow shell, and NCB
+    needs log(2.22/1.59) = 0.34 where the default cap allows 0.14. A conform run
+    is not silent about it — the stretch is recorded and spec 9.1's anisotropy
+    rule still fires — but the default is untouched, so every other caller keeps
+    the proportion-preserving behaviour.
     """
     target = _target_geom(fp)
-    cap = math.log(1.0 + ANISO_EPS)
+    cap = math.log(1.0 + ANISO_EPS) if aniso_cap is None else float(aniso_cap)
+    # Spec 6.9's soft penalty expresses a PREFERENCE for uniform scale. A
+    # conform run has already overruled that preference on purpose, and at
+    # lr = 0.34 the penalty (0.058) is the same size as the IoU it would buy,
+    # so leaving it on would quietly cancel the stretch that was asked for.
+    soft = ANISO_LAMBDA if aniso_cap is None else 0.0
 
     def unpack(v):
         if allow_anisotropy:
@@ -252,7 +266,7 @@ def iou_refine(fp: Footprint, mo: MeshOutline, params: dict,
             lr = math.log(sx / sy)
             if abs(lr) > cap:
                 penalty += 1e3 * (abs(lr) - cap) ** 2   # the hard constraint
-            penalty += ANISO_LAMBDA * lr ** 2           # the soft one
+            penalty += soft * lr ** 2                   # the soft one
         return -j + penalty
 
     if allow_anisotropy:
@@ -280,7 +294,8 @@ def solve(fp: Footprint, mo: MeshOutline,
           disambiguated_by: Disambiguator = Disambiguator.ASPECT_RATIO,
           use_icp: bool = True,
           use_iou_refine: bool = True,
-          allow_anisotropy: bool = False) -> FitResult:
+          allow_anisotropy: bool = False,
+          aniso_cap: float | None = None) -> FitResult:
     """Full solve. -> FitResult in the ENU frame.
 
     `chosen` comes from geo.disambiguate; when None, the best footprint IoU
@@ -302,8 +317,9 @@ def solve(fp: Footprint, mo: MeshOutline,
         params = icp_refine(fp, mo, params)
         stages.append("icp")
     if use_iou_refine:
-        params = iou_refine(fp, mo, params, allow_anisotropy=allow_anisotropy)
-        stages.append("nelder-mead")
+        params = iou_refine(fp, mo, params, allow_anisotropy=allow_anisotropy,
+                            aniso_cap=aniso_cap)
+        stages.append("nelder-mead" if aniso_cap is None else "nelder-mead+conform")
 
     from geo.validate import compute_metrics
     metrics = compute_metrics(fp, mo, params)

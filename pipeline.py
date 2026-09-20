@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -46,6 +47,12 @@ from geo.overlay import render_overlay
 
 DATA_DIR = Path(__file__).resolve().parent / "data" / "runs"
 
+# --conform's hard cap on |log(sx/sy)|: a 2.5x stretch between the two
+# horizontal axes. Measured need across the demo set: NCB 0.34, Whittemore 0.62,
+# Goodwin 0.89 (its plan is the wrong shape, not merely squashed). Beyond this
+# the mesh is not a squashed building, and stretching it further only hides that.
+CONFORM_ANISO_CAP = math.log(2.5)
+
 
 def run(address: str,
         *,
@@ -58,7 +65,9 @@ def run(address: str,
         seed: int = 42,
         asset_id: str | None = None,
         mask_for_generation: bool = True,
-        force_candidate: int | None = None) -> PlacementRecord:
+        force_candidate: int | None = None,
+        conform: bool = False,
+        lifter: str = "trellis") -> PlacementRecord:
 
     asset_id = asset_id or str(uuid.uuid4())
     run_dir = DATA_DIR / asset_id
@@ -102,7 +111,8 @@ def run(address: str,
     if not dry_run and photos:
         mesh_vertices, models = _generate(photos, prompt, run_dir, seed, log,
                                           photo_ev=photo_ev,
-                                          use_mask=mask_for_generation)
+                                          use_mask=mask_for_generation,
+                                          lifter=lifter)
 
     # -- 6.1-6.4 canonicalise -----------------------------------------------
     if mesh_vertices is not None:
@@ -177,6 +187,33 @@ def run(address: str,
     result = _replace(result, exif_silhouette_disagree=exif_sil_disagree)
     log(f"fit: IoU={result.iou:.3f} hausdorff={result.hausdorff_m:.2f}m "
         f"area_ratio={result.area_ratio:.3f} margin={result.rotation_margin_footprint:.3f}")
+
+    # -- conform: stretch the mesh onto the footprint (opt-in) ---------------
+    # Single-view generators return a shallow shell — NCB came back 1.59:1
+    # where the building is 2.22:1 — and a uniform scale cannot fix a wrong
+    # aspect: matching the area makes the ends overhang. --conform allows a
+    # per-axis scale so the plan matches, which is what a studio does with a
+    # bought asset. The uniform fit is kept alongside, and spec 9.1's
+    # anisotropy rule still fires, so the record says it was stretched.
+    conform_info = None
+    if conform:
+        uniform = result
+        result = fitmod.solve(fp, mo, chosen=chosen, disambiguated_by=by,
+                              allow_anisotropy=True, aniso_cap=CONFORM_ANISO_CAP)
+        result = _replace(result, exif_silhouette_disagree=exif_sil_disagree)
+        conform_info = {
+            "enabled": True,
+            "aniso_cap": CONFORM_ANISO_CAP,
+            "stretch_ratio": round(math.exp(abs(result.anisotropy_log_ratio)), 4),
+            "aniso_log_ratio": round(result.anisotropy_log_ratio, 4),
+            "uniform_iou": round(uniform.iou, 4),
+            "uniform_hausdorff_m": round(uniform.hausdorff_m, 3),
+            "conformed_iou": round(result.iou, 4),
+            "conformed_hausdorff_m": round(result.hausdorff_m, 3),
+        }
+        log(f"conform: stretched {conform_info['stretch_ratio']:.2f}x -> "
+            f"IoU {uniform.iou:.3f} -> {result.iou:.3f}, "
+            f"hausdorff {uniform.hausdorff_m:.2f} -> {result.hausdorff_m:.2f} m")
 
     # -- 9.2 neighbour collision --------------------------------------------
     metrics = validate.compute_metrics(fp, mo, {
@@ -274,7 +311,11 @@ def run(address: str,
         "seed": seed,
         "allow_anisotropy": bool(allow_anisotropy),
         "mask_for_generation": bool(mask_for_generation),
+        "conform": bool(conform),
+        "lifter": lifter,
     }
+    if conform_info:
+        record_dict["conform"] = conform_info
     record_dict["orientation"] = {
         "chosen_k": chosen.azimuth_k,
         "up_axis_idx": mo.up_axis_idx,
@@ -497,7 +538,8 @@ def _generation_input(photo, photo_ev, run_dir, log, *, use_mask, index=0):
     return out, {"stage": "mask", "name": model, "output": out.name}
 
 
-def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=True):
+def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=True,
+              lifter="trellis"):
     from generate.edit import edit_image
     from generate.lift import lift_to_mesh, load_vertices
 
@@ -538,12 +580,12 @@ def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=Tru
 
     glb = run_dir / "mesh.glb"
     log(f"lift: TRELLIS from {len(edited)} view(s) (10-60 s)")
-    glb, params = lift_to_mesh(edited, glb, seed=seed)
+    glb, params = lift_to_mesh(edited, glb, seed=seed, lifter=lifter)
 
     models = [
         *[m for m in mask_models if m],
         {"stage": "edit", "name": "flux-kontext-pro", "seed": seed},
-        {"stage": "lift", "name": "trellis", "seed": seed, "params": params},
+        {"stage": "lift", "name": lifter, "seed": seed, "params": params},
     ]
     return load_vertices(glb), models
 
@@ -647,6 +689,13 @@ def main(argv=None) -> int:
     ap.add_argument("--asset-id", default=None,
                     help="re-use an existing run directory: its cached edit and "
                          "mesh are used, so no model is re-run and nothing is billed")
+    ap.add_argument("--lifter", choices=["trellis", "hunyuan"], default="trellis",
+                    help="image-to-3D model. hunyuan = Hunyuan3D-2.1, a "
+                         "different depth prior; single image only")
+    ap.add_argument("--conform", action="store_true",
+                    help="stretch the mesh per-axis so its plan matches the "
+                         "footprint (single-view meshes come out shallow). The "
+                         "stretch is recorded and still flagged by spec 9.1")
     ap.add_argument("--force-candidate", type=int, default=None, choices=[0, 1, 2, 3],
                     help="spec 9.3 review: re-solve with this azimuth candidate "
                          "instead of the disambiguator's choice. Free with "
@@ -663,7 +712,8 @@ def main(argv=None) -> int:
                   allow_anisotropy=args.anisotropy, seed=args.seed,
                   asset_id=args.asset_id,
                   mask_for_generation=not args.no_mask,
-                  force_candidate=args.force_candidate)
+                  force_candidate=args.force_candidate,
+                  conform=args.conform, lifter=args.lifter)
     except (LookupError, RuntimeError, ValueError) as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         return 1

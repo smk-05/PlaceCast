@@ -47,13 +47,48 @@ DEFAULT_PARAMS = {
     "generate_normal": False,
 }
 
+# A second lifter, because the first one is the demo's bottleneck. Single-view
+# TRELLIS returns a shallow shell: NCB's plan came out 1.59:1 where the building
+# is 2.22:1, Patton's filled 18% of its bounding box where the real footprint
+# fills 81%. Hunyuan3D-2.1 is a different image-to-3D model with its own depth
+# prior, so it is worth measuring rather than assuming. Same rules: version
+# PINNED (verified live 2026-09-19), seed recorded, one image in, a glb out.
+HUNYUAN_MODEL = ("ndreca/hunyuan3d-2.1:"
+                 "895e514f953d39e8b5bfb859df9313481ad3fa3a8631e5c54c7e5c9c85a6aa9f")
+HUNYUAN_PARAMS = {
+    "steps": 50,
+    "guidance_scale": 7.5,
+    "octree_resolution": 256,
+    "max_facenum": 20000,
+    "generate_texture": True,
+    # Our input is already a building cut out on white (generate/mask.py), so
+    # the model's own background removal has nothing left to do — and running
+    # it on a white field has been known to eat pale facades.
+    "remove_background": False,
+}
+
+LIFTERS = {
+    # name: (pinned model, default params, how the image goes into the payload)
+    "trellis": (MODEL, DEFAULT_PARAMS, "images"),
+    "hunyuan": (HUNYUAN_MODEL, HUNYUAN_PARAMS, "image"),
+}
+
 
 def lift_to_mesh(image_paths: list[Path], out_path: Path,
                  *, seed: int = 42, force: bool = False,
-                 params: dict | None = None) -> tuple[Path, dict]:
-    """-> (path to .glb, the params actually used). Cached by out_path."""
+                 params: dict | None = None,
+                 lifter: str = "trellis") -> tuple[Path, dict]:
+    """-> (path to .glb, the params actually used). Cached by out_path.
+
+    `lifter` picks the image-to-3D model: "trellis" (multi-view capable) or
+    "hunyuan" (Hunyuan3D-2.1, single image only — extra views are ignored, and
+    the caller is told).
+    """
     out_path = Path(out_path)
-    merged = {**DEFAULT_PARAMS, **(params or {}), "seed": seed}
+    if lifter not in LIFTERS:
+        raise ValueError(f"unknown lifter {lifter!r}; pick one of {sorted(LIFTERS)}")
+    model, defaults, image_key = LIFTERS[lifter]
+    merged = {**defaults, **(params or {}), "seed": seed}
 
     if out_path.exists() and not force:
         return out_path, merged
@@ -67,13 +102,19 @@ def lift_to_mesh(image_paths: list[Path], out_path: Path,
 
     from generate import throttle
 
+    if image_key == "image" and len(image_paths) > 1:
+        print(f"lift[{lifter}]: single-image model — using {Path(image_paths[0]).name} "
+              f"and ignoring {len(image_paths) - 1} other view(s)")
+        image_paths = image_paths[:1]
+
     handles = [open(p, "rb") for p in image_paths]
     try:
-        # The PINNED version's schema requires `images` (an array), verified
-        # against the live API 2026-09-19. A 422 "image is required" means a
-        # different, unpinned version is being called, not that this is wrong.
-        payload = {**merged, "images": handles}
-        output = throttle.run(MODEL, input=payload)
+        # TRELLIS's PINNED version requires `images` (an array), verified
+        # against the live API 2026-09-19; a 422 "image is required" means a
+        # different, unpinned version is being called. Hunyuan takes a single
+        # `image`, hence the per-lifter key rather than one hardcoded name.
+        payload = {**merged, image_key: handles if image_key == "images" else handles[0]}
+        output = throttle.run(model, input=payload)
     finally:
         for h in handles:
             h.close()
