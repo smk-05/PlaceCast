@@ -134,6 +134,7 @@ async function show(assetId) {
     await drawBuilding(rec, ground, () => token === showToken);
     if (token !== showToken) return;
     renderPanel(rec);
+    renderDetections(rec);
     renderMarkerControls(rec);
     renderPhotoViewButton(rec);
     renderTextureToggle();
@@ -525,6 +526,65 @@ openingClicks.setInputAction((click) => {
 
 /** perception/openings_prism.py could not fit the photo's camera to the building (low IoU, or a best value on the edge of
  *  the search grid): the openings are still in the record, but where they would stand is not to be trusted. */
+/**
+ * The 2D detection overlay (perception/openings.py's picture of what it found in the photo), copied into the run folder
+ * as detections.png and served like any run file. A thumbnail under the building info, captioned with what was detected
+ * and how much of it was placed on the building; click it to see it full size, click again to close. Not shown for a
+ * record with no openings or no detections.png.
+ */
+const DOOR_TYPES = ['door', 'entrance', 'garage_door'];
+
+function detectionCaption(rec) {
+  const all = rec.openings || [];
+  const doors = all.filter((o) => DOOR_TYPES.includes(o.type)).length;
+  const windows = all.filter((o) => o.type === 'window').length;
+  // "Placed" = has a 3-D position and size on the building. An unreliable camera fit withholds every marker.
+  const placed = cameraUnreliable(rec)
+    ? 0
+    : all.filter((o) => o.position_enu && o.normal_enu && o.width_m && o.height_m).length;
+  return `Detected in photo: ${doors} doors/entrances, ${windows} windows (${placed} placed on the building)`;
+}
+
+function showDetectionsOverlay(src) {
+  let overlay = document.getElementById('detections-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'detections-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:20;display:none;align-items:center;justify-content:center;'
+      + 'background:rgba(0,0,0,.85);cursor:zoom-out;';
+    const big = document.createElement('img');
+    big.style.cssText = 'max-width:96vw;max-height:96vh;box-shadow:0 0 24px #000;';
+    big.alt = 'Openings detected in the photo, full size';
+    overlay.appendChild(big);
+    overlay.addEventListener('click', () => { overlay.style.display = 'none'; });
+    document.body.appendChild(overlay);
+  }
+  overlay.firstChild.src = src;
+  overlay.style.display = 'flex';
+}
+
+function renderDetections(rec) {
+  if (!Array.isArray(rec.openings)) return;
+  const src = `/assets-data/${rec.asset_id}/detections.png`;
+  const figure = document.createElement('figure');
+  figure.style.cssText = 'margin:8px 0';
+  const img = document.createElement('img');
+  img.src = src;
+  img.alt = 'Openings detected in the photo';
+  img.title = 'Click to enlarge';
+  img.style.cssText = 'width:100%;display:block;cursor:zoom-in;border:1px solid #444;';
+  img.addEventListener('click', () => showDetectionsOverlay(src));
+  img.addEventListener('error', () => { figure.style.display = 'none'; }); // no detections.png for this run
+  const caption = document.createElement('figcaption');
+  caption.style.cssText = 'font-size:12px;margin-top:4px;';
+  caption.textContent = detectionCaption(rec);
+  figure.appendChild(img);
+  figure.appendChild(caption);
+  const table = metaEl.querySelector('table'); // under the building info
+  if (table) table.after(figure);
+  else metaEl.appendChild(figure);
+}
+
 function cameraUnreliable(rec) {
   return rec.openings_camera?.reliable === false;
 }
