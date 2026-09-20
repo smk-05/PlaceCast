@@ -121,6 +121,8 @@ async function show(assetId) {
       viewer.scene.primitives.removeAll();
       texturedModels = {};
       texturedRec = null;
+      schematicPrims = [];
+      openingsCtx = null;
       openingPrims = [];
       openingsById = new Map();
       showOpeningInfo(undefined);
@@ -278,11 +280,14 @@ async function drawBuilding(rec, ground, stillCurrent = () => true) {
     // than the placement. The prism is exact in plan by construction — what it
     // still shows is everything the placement chain contributes: which
     // building, its outline, its height, and the ground it stands on.
-    // A record with baked textures (perception/prism_texture.py) draws those walls instead of the flat polygon;
-    // the polygon stays as the fallback when there are none or they fail to load.
-    const textured = await drawTexturedPrism(rec, enuToFixed, stillCurrent);
+    // SCHEMATIC is the default view: this flat footprint prism, in a neutral solid colour. A record with baked
+    // textures (perception/prism_texture.py) has them loaded here too, but hidden: "Photo texture" and "Scorched"
+    // (both experimental) swap them in for the prism (see applyView).
+    viewMode = 'schematic';
+    drawSchematic(rec, ground);
+    await drawTexturedPrism(rec, enuToFixed, stillCurrent);
     if (!stillCurrent()) return;
-    if (!textured) drawFootprintPrism(rec, ground);
+    openingsCtx = { rec, enuToFixed };
     if (!cameraUnreliable(rec)) drawOpenings(rec, enuToFixed);  // an unreliable fit withholds its markers (panel says so)
   } else {
     errEl.textContent = `Unknown mesh_frame "${m2e.mesh_frame}" — not drawing anything.`;
@@ -303,8 +308,8 @@ function drawFootprintPrism(rec, ground) {
     addPolygon(rings, {
       height: ground,                        // pinned terrain, as for a mesh
       extrudedHeight: ground + height,
-      colour: Cesium.Color.fromCssColorString('#c9a227').withAlpha(0.85),
-      outlineColour: Cesium.Color.fromCssColorString('#5c4708'),
+      colour: Cesium.Color.fromCssColorString('#dcd9d1'),          // neutral, light, solid
+      outlineColour: Cesium.Color.fromCssColorString('#a9a69e'),   // subtle
     });
   }
 }
@@ -316,6 +321,10 @@ function drawFootprintPrism(rec, ground) {
  * toggle flips `show`. The opening markers stand 7 cm proud of the wall plane, so they never z-fight with it.
  * Returns true when at least one model is on screen.
  */
+let viewMode = 'schematic'; // 'schematic' (default) | 'photo' | 'scorched'
+let schematicPrims = []; // the flat prism's primitives, so a texture view can hide them
+let openingsCtx = null; // { rec, enuToFixed }: what the markers are drawn from, so they can be redrawn on a mode change
+let drawnFillAlpha = 0.6; // the fill alpha the markers were last drawn with
 let texturedModels = {};
 let texturedRec = null; // the record whose textures are on screen
 let texturedFrame = null; // its enuToFixed, kept so the AI twins can be loaded later
@@ -330,6 +339,15 @@ async function loadTexturedModel(rec, enuToFixed, key, file) {
     forwardAxis: Cesium.Axis.X,
   });
   return model;
+}
+
+/** The flat footprint prism, remembering its primitives (drawFootprintPrism adds them to the scene). */
+function drawSchematic(rec, ground) {
+  const scene = viewer.scene.primitives;
+  const before = scene.length;
+  drawFootprintPrism(rec, ground);
+  schematicPrims = [];
+  for (let i = before; i < scene.length; i++) schematicPrims.push(scene.get(i));
 }
 
 async function drawTexturedPrism(rec, enuToFixed, stillCurrent) {
@@ -352,63 +370,72 @@ async function drawTexturedPrism(rec, enuToFixed, stillCurrent) {
     }
   }
   textureVariant = texturedModels.photo ? 'photo' : Object.keys(texturedModels)[0];
-  if (!textureVariant) return false;
-  texturedModels[textureVariant].show = true;
-  return true;
+  return !!textureVariant; // every model stays hidden: the schematic is what is shown until a texture view is picked
 }
 
-/** Show the model for the current variant, or its AI-tinted twin (loaded the first time it is asked for). The twin is
- *  the same building with the texels FLUX Fill generated painted magenta (perception/prism_texture.py writes it as
- *  prism_<variant>_ai.glb and lists it in rec.textured_glbs_ai). */
-async function showTextured() {
+/** Apply the current view: the schematic prism, or the textured model for the chosen variant (or its AI-tinted twin,
+ *  loaded the first time it is asked for). The twin is the same building with the texels FLUX Fill generated painted
+ *  magenta (perception/prism_texture.py writes it as prism_<variant>_ai.glb and lists it in rec.textured_glbs_ai).
+ *  The markers are redrawn when the view changes how solid they should be. */
+async function applyView() {
   const rec = texturedRec;
-  const twinFile = rec?.textured_glbs_ai?.[textureVariant];
-  const wanted = aiOverlay && twinFile ? `${textureVariant}_ai` : textureVariant;
-  if (!texturedModels[wanted] && twinFile && wanted.endsWith('_ai')) {
-    try {
-      const model = await loadTexturedModel(rec, texturedFrame, wanted, twinFile);
-      if (texturedRec !== rec) {
-        model.destroy?.();
+  const schematic = viewMode === 'schematic';
+  for (const prim of schematicPrims) prim.show = schematic;
+  let wanted = null;
+  if (!schematic) {
+    const twinFile = rec?.textured_glbs_ai?.[textureVariant];
+    wanted = aiOverlay && twinFile ? `${textureVariant}_ai` : textureVariant;
+    if (!texturedModels[wanted] && twinFile && wanted.endsWith('_ai')) {
+      try {
+        const model = await loadTexturedModel(rec, texturedFrame, wanted, twinFile);
+        if (texturedRec !== rec) {
+          model.destroy?.();
+          return;
+        }
+        model.show = false;
+        viewer.scene.primitives.add(model);
+        texturedModels[wanted] = model;
+      } catch (e) {
+        console.warn('AI overlay failed to load', e);
         return;
       }
-      model.show = false;
-      viewer.scene.primitives.add(model);
-      texturedModels[wanted] = model;
-    } catch (e) {
-      console.warn('AI overlay failed to load', e);
-      return;
     }
   }
   for (const [key, model] of Object.entries(texturedModels)) model.show = key === wanted;
+  if (markerFillAlpha() !== drawnFillAlpha) redrawOpenings();
 }
 
-/** Photo <-> Scorched switch and the "AI-filled" overlay at the top of the panel (call after renderPanel, which
- *  rewrites the panel). The overlay is offered only when the record has AI-filled regions to show. */
+/** The view switch (Schematic / Photo texture / Scorched, the last two experimental) and the "AI-filled" overlay at the
+ *  top of the panel (call after renderPanel, which rewrites the panel). Offered only when the record has textures;
+ *  the overlay only when it has AI-filled regions to show, and only in a texture view. */
 function renderTextureToggle() {
   if (!Object.keys(texturedModels).length) return;
-  const button = (key, label) => `<button data-tex="${key}"${texturedModels[key] ? '' : ' disabled'}
-    style="margin-right:6px;font-weight:${key === textureVariant ? 'bold' : 'normal'}">${label}</button>`;
+  const button = (key, label) => `<button data-tex="${key}"${key === 'schematic' || texturedModels[key] ? '' : ' disabled'}
+    style="margin:0 6px 4px 0;font-weight:${key === viewMode ? 'bold' : 'normal'}">${label}</button>`;
   const twins = texturedRec?.textured_glbs_ai || {};
+  const overlayOff = () => viewMode === 'schematic' || !twins[textureVariant];
   const overlay = Object.keys(twins).length
-    ? `<div style="margin-top:4px"><label><input type="checkbox" id="ai-overlay"${twins[textureVariant] ? '' : ' disabled'}>
+    ? `<div style="margin-top:4px"><label><input type="checkbox" id="ai-overlay"${overlayOff() ? ' disabled' : ''}>
        AI-filled overlay</label> <small>(tints what FLUX Fill generated)</small></div>`
     : '';
   metaEl.insertAdjacentHTML('afterbegin',
-    `<div class="flags"><b>texture</b><div>${button('photo', 'Photo')}${button('scorched', 'Scorched')}</div>${overlay}</div>`);
+    `<div class="flags"><b>view</b><div>${button('schematic', 'Schematic')}${button('photo', 'Photo texture (experimental)')}`
+    + `${button('scorched', 'Scorched (experimental)')}</div>${overlay}</div>`);
   metaEl.querySelectorAll('button[data-tex]').forEach((b) => b.addEventListener('click', () => {
-    textureVariant = b.dataset.tex;
+    viewMode = b.dataset.tex;
+    if (viewMode !== 'schematic') textureVariant = viewMode;
     metaEl.querySelectorAll('button[data-tex]').forEach((x) => {
       x.style.fontWeight = x === b ? 'bold' : 'normal';
     });
     const box = document.getElementById('ai-overlay');
-    if (box) box.disabled = !twins[textureVariant];
-    showTextured();
+    if (box) box.disabled = overlayOff();
+    applyView();
   }));
   const box = document.getElementById('ai-overlay');
   if (box) {
     box.addEventListener('change', () => {
       aiOverlay = box.checked;
-      showTextured();
+      applyView();
     });
   }
 }
@@ -431,9 +458,15 @@ let openingPrims = [];
 let openingsById = new Map();
 const defaultFov = viewer.camera.frustum.fov;
 
+/** Marker fill: solid-ish (60%) on the schematic, 25% over a texture so the painted windows show through. */
+function markerFillAlpha() {
+  return viewMode === 'schematic' ? 0.6 : 0.25;
+}
+
 function drawOpenings(rec, enuToFixed) {
   openingPrims = [];
   openingsById = new Map();
+  drawnFillAlpha = markerFillAlpha();
   const items = (rec.openings || []).filter(
     (o) => o.position_enu && o.normal_enu && o.width_m && o.height_m,
   );
@@ -456,7 +489,7 @@ function drawOpenings(rec, enuToFixed) {
         vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT,
       }),
       modelMatrix,
-      attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(typeColour.withAlpha(0.25)) },
+      attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(typeColour.withAlpha(drawnFillAlpha)) },
     }));
     const outline = review ? Cesium.Color.fromCssColorString(REVIEW_RED) : typeColour;
     for (const grow of review ? REVIEW_OUTLINE_GROW : [0]) {
@@ -492,6 +525,23 @@ function drawOpenings(rec, enuToFixed) {
       openingPrims.push(prim);
     }
   }
+}
+
+/** Markers on/off and Show review, read from the panel (so a redraw keeps what the user chose). */
+function applyMarkerVisibility() {
+  const on = document.getElementById('markers-on')?.checked ?? true;
+  const withReview = document.getElementById('show-review')?.checked ?? false;
+  for (const prim of openingPrims) prim.show = on && (!prim.isReview || withReview);
+  if (!on) showOpeningInfo(undefined);
+}
+
+/** Draw the markers again (a new fill alpha), keeping the Markers / Show review choices. */
+function redrawOpenings() {
+  if (!openingsCtx || !openingPrims.length) return; // nothing was drawn (an unreliable fit withholds them)
+  for (const prim of openingPrims) viewer.scene.primitives.remove(prim);
+  showOpeningInfo(undefined);
+  drawOpenings(openingsCtx.rec, openingsCtx.enuToFixed);
+  applyMarkerVisibility();
 }
 
 /** Details of one opening (from a click on its marker), or hidden when `o` is undefined. */
@@ -663,14 +713,8 @@ function renderMarkerControls(rec) {
     + `<label style="margin-left:12px"><input type="checkbox" id="show-review"> Show review</label>`
     + `<div id="opening-counts" style="margin-top:4px">${accepted} accepted &middot; ${review} in review</div>`
     + `<div style="margin-top:4px;font-size:12px">${legend}</div></div>`);
-  const apply = () => {
-    const on = document.getElementById('markers-on').checked;
-    const withReview = document.getElementById('show-review').checked;
-    for (const prim of openingPrims) prim.show = on && (!prim.isReview || withReview);
-    if (!on) showOpeningInfo(undefined);
-  };
-  document.getElementById('markers-on').addEventListener('change', apply);
-  document.getElementById('show-review').addEventListener('change', apply);
+  document.getElementById('markers-on').addEventListener('change', applyMarkerVisibility);
+  document.getElementById('show-review').addEventListener('change', applyMarkerVisibility);
 }
 
 /**
@@ -827,6 +871,8 @@ clearEl.addEventListener('click', () => {
   viewer.scene.primitives.removeAll();
   texturedModels = {};
   texturedRec = null;
+  schematicPrims = [];
+  openingsCtx = null;
   openingPrims = [];
   openingsById = new Map();
   drawn.length = 0;
