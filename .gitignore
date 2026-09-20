@@ -23,3 +23,7 @@ photos/
 
 # Generated artifacts (confidence/train.py, perception/segment.py outputs)
 outputs/
+
+# A 61 MB downloaded asset used for the "place any model" demo. Not ours to
+# redistribute and too big for git; see HANDOVER.md for how to reproduce it.
+building-buildify-nyc/

@@ -5,9 +5,13 @@
     "photo": "ncb_5.jpg",
     "perception": "real",
     "decision": "reject",
-    "iou": 0.796,
-    "hausdorff_m": 9.89,
-    "disambiguated_by": "exif_heading"
+    "iou": 0.823,
+    "hausdorff_m": 10.05,
+    "disambiguated_by": "exif_heading",
+    "conform_asset_id": "0052eb8c-1d0e-44b5-97ab-a236d420eb81",
+    "conformed_iou": 0.8424,
+    "conformed_hausdorff_m": 12.239,
+    "stretch_ratio": 1.1716
   },
   "burruss": {
     "address": "Burruss Hall, Blacksburg, VA",
@@ -15,9 +19,13 @@
     "photo": "burruss_1.jpg",
     "perception": "real",
     "decision": "reject",
-    "iou": 0.775,
-    "hausdorff_m": 30.71,
-    "disambiguated_by": "exif_heading"
+    "iou": 0.82,
+    "hausdorff_m": 13.61,
+    "disambiguated_by": "exif_heading",
+    "conform_asset_id": "cbef4508-53ae-4f01-b55f-099eb45d230d",
+    "conformed_iou": 0.8537,
+    "conformed_hausdorff_m": 10.651,
+    "stretch_ratio": 1.151
   },
   "patton": {
     "address": "Patton Hall, Blacksburg, VA",
@@ -25,9 +33,13 @@
     "photo": "patton_1.jpg",
     "perception": "real",
     "decision": "reject",
-    "iou": 0.328,
-    "hausdorff_m": 55.3,
-    "disambiguated_by": "exif_heading"
+    "iou": 0.623,
+    "hausdorff_m": 9.83,
+    "disambiguated_by": "exif_heading",
+    "conform_asset_id": "db4632e3-2687-409a-bff4-2aeff46144ef",
+    "conformed_iou": 0.881,
+    "conformed_hausdorff_m": 2.743,
+    "stretch_ratio": 1.5963
   },
   "warmemorial": {
     "address": "War Memorial Hall, Blacksburg, VA",
@@ -35,9 +47,13 @@
     "photo": "warmemorial_2.jpg",
     "perception": "real",
     "decision": "reject",
-    "iou": 0.451,
-    "hausdorff_m": 27.17,
-    "disambiguated_by": "exif_heading"
+    "iou": 0.462,
+    "hausdorff_m": 29.86,
+    "disambiguated_by": "exif_heading",
+    "conform_asset_id": "bddec00a-9d5f-4145-947c-beadcd3cbecd",
+    "conformed_iou": 0.4692,
+    "conformed_hausdorff_m": 28.778,
+    "stretch_ratio": 1.0267
   },
   "whittemore": {
     "address": "Whittemore Hall, Blacksburg, VA",
@@ -45,9 +61,13 @@
     "photo": "whittemore_1.jpg",
     "perception": "real",
     "decision": "reject",
-    "iou": 0.541,
-    "hausdorff_m": 22.53,
-    "disambiguated_by": "exif_heading"
+    "iou": 0.566,
+    "hausdorff_m": 20.9,
+    "disambiguated_by": "exif_heading",
+    "conform_asset_id": "adf77142-d346-4d32-8592-ed27069ea2fd",
+    "conformed_iou": 0.7717,
+    "conformed_hausdorff_m": 10.047,
+    "stretch_ratio": 2.173
   },
   "goodwin": {
     "address": "Goodwin Hall, Blacksburg, VA",
@@ -55,8 +75,18 @@
     "photo": "goodwin_1.jpg",
     "perception": "real",
     "decision": "reject",
-    "iou": 0.589,
-    "hausdorff_m": 37.51,
-    "disambiguated_by": "exif_heading"
+    "iou": 0.633,
+    "hausdorff_m": 19.69,
+    "disambiguated_by": "exif_heading",
+    "conform_asset_id": "99ca674e-52fa-4a9a-a047-98d75cd1ff19",
+    "conformed_iou": 0.6613,
+    "conformed_hausdorff_m": 26.542,
+    "stretch_ratio": 1.6241
+  },
+  "_nyc_model_demo": {
+    "address": "Undergraduate Science Laboratory Building, Blacksburg, VA",
+    "asset_id": "nyc-model-demo",
+    "source": "building-buildify-nyc/source/Untitled.glb (downloaded asset, NOT in git)",
+    "note": "placed with pipeline.py --mesh; no photo, no generation"
   }
 }
