@@ -50,7 +50,8 @@ the INFINITE plane of the wall the centre ray hit (not the prism mesh); a corner
 max(0.5 m, d x tan 1.25 deg) is the camera fit's angular uncertainty at d, the camera-to-wall distance along the centre
 ray (2.5 m at 114 m); it is recorded per opening as corner_tolerance_m.
 width_m / height_m come from those corner points, bottom_above_ground_m from the two bottom
-corners. Doors, entrances and garage doors whose bottom is more than
+corners. A door, entrance or garage door is passable, so its marker is clamped to ground level (bottom = max(0,
+computed bottom); the height and centre are recomputed; `ground_clamp_m` records the lift). Doors, entrances and garage doors whose bottom is more than
 DOOR_MAX_BOTTOM_M above ground go to REVIEW: a real door reaches the ground.
 
 Viewer. There is no glb to add child nodes to (web/src/main.js draws the prism as a Cesium polygon extrusion), so the
@@ -529,6 +530,20 @@ def _corner_points(prism, wall_index, origin, rays, tol):
     return pts, valid
 
 
+def _clamp_to_ground(rec, prism, top, bottom):
+    """A door, entrance or garage door is walked through, so its marker cannot stand below the ground: the fit's
+    vertical error would otherwise draw it sunk into the terrain. Raise the bottom edge to ground level (z = 0) and
+    recompute the height and the centre from the top edge. `ground_clamp_m` says how far it was raised."""
+    if top <= 0.05:  # the whole opening is below ground: nothing sensible to clamp to
+        return
+    rec["ground_clamp_m"] = float(-bottom)
+    rec["height_m"] = float(top)
+    position = np.array(rec["position_enu"], float)
+    position[2] = top / 2.0
+    lat, lon, h = prism.frame.enu_to_geodetic(*position)
+    rec.update(position_enu=position, lat=float(lat), lon=float(lon), height_above_ground_m=float(h - prism.frame.h0))
+
+
 def _place_one(index, op, prism, origin, rays, hits, is_wall, source_photo):
     reasons = list(op.get("reasons") or [])
     decision = op.get("decision", "REVIEW")
@@ -537,7 +552,7 @@ def _place_one(index, op, prism, origin, rays, hits, is_wall, source_photo):
         "group_margin": op.get("group_margin"), "source_photo": source_photo,
         "wall_index": None, "normal_enu": None, "bearing_deg": None, "hit_enu": None, "position_enu": None,
         "lat": None, "lon": None, "height_above_ground_m": None, "width_m": None, "height_m": None,
-        "bottom_above_ground_m": None, "corner_hits": 0, "corner_tolerance_m": None,
+        "bottom_above_ground_m": None, "corner_hits": 0, "corner_tolerance_m": None, "ground_clamp_m": None,
     }
 
     def review(reason):
@@ -576,6 +591,9 @@ def _place_one(index, op, prism, origin, rays, hits, is_wall, source_photo):
             review(f"{int((~valid).sum())} of 4 corner rays missed the wall (past its ends or more than {tol:.1f} m "
                    "below ground, or above the roof): size unreliable")
         bottoms = [pts[k, 2] for k in (2, 3) if valid[k]]  # BR, BL
+        if valid.all() and op["type"] in DOOR_TYPES and float(np.mean(bottoms)) < 0.0:
+            _clamp_to_ground(rec, prism, top=float(np.mean(pts[:2, 2])), bottom=float(np.mean(bottoms)))
+            bottoms = [0.0]
     too_wide = op["type"] == "window" and rec["width_m"] is not None and rec["width_m"] > MAX_WINDOW_WIDTH_M
     too_tall = rec["height_m"] is not None and rec["height_m"] > MAX_OPENING_HEIGHT_M
     if too_wide or too_tall:  # a grazing view stretches boxes along the wall

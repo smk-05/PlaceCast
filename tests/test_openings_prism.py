@@ -465,3 +465,42 @@ def test_the_stored_camera_carries_the_photos_field_of_view():
     assert d["hfov_deg"] == pytest.approx(math.degrees(2 * math.atan(160 / 300)))  # 55.9 deg
     assert d["vfov_deg"] == pytest.approx(math.degrees(2 * math.atan(120 / 300)))  # 43.6 deg
     assert d["camera_yaw_deg"] == 0.0 and d["camera_position_enu"] == [0, -40, 1.5]
+
+
+# ---------------------------------------------------- passable openings stand on the ground
+
+
+def test_a_doors_marker_is_clamped_to_ground_level_and_recentred():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    door = _on_south("sunk_door", cam, mask, cx=0.0, z0=-0.6, w=2.0, h=3.6, type_="door")  # 0.6 m below ground, top at 3.0
+    r, = _place(prism, cam, mask, [door]).openings
+    assert r["ground_clamp_m"] == pytest.approx(0.6, abs=0.05)
+    assert r["bottom_above_ground_m"] == 0.0
+    assert r["height_m"] == pytest.approx(3.0, abs=0.05)  # from ground to the top edge, not the 3.6 m the corners span
+    assert r["position_enu"][2] == pytest.approx(1.5, abs=0.05)  # the centre moved with it: (3.0 + 0) / 2
+    assert r["height_above_ground_m"] == pytest.approx(1.5, abs=0.05)
+    assert r["position_enu"][2] - r["height_m"] / 2 >= -1e-6  # the marker does not extend below ground
+    assert r["decision"] == "ACCEPT"  # it reaches the ground now, so the door rule is satisfied
+
+
+def test_entrances_and_garage_doors_are_clamped_too_but_windows_are_not():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    ops = [_on_south("ent", cam, mask, cx=-6.0, z0=-0.5, w=2.0, h=3.5, type_="entrance"),
+           _on_south("gar", cam, mask, cx=0.0, z0=-0.5, w=2.0, h=3.5, type_="garage_door"),
+           _on_south("win", cam, mask, cx=6.0, z0=-0.5, w=2.0, h=3.5, type_="window")]
+    ent, gar, win = _place(prism, cam, mask, ops).openings
+    for r in (ent, gar):
+        assert r["ground_clamp_m"] == pytest.approx(0.5, abs=0.05) and r["bottom_above_ground_m"] == 0.0
+        assert r["height_m"] == pytest.approx(3.0, abs=0.05)
+    assert win["ground_clamp_m"] is None and win["bottom_above_ground_m"] == pytest.approx(-0.5, abs=0.05)
+    assert win["height_m"] == pytest.approx(3.5, abs=0.05)  # a window keeps what the corners say
+
+
+def test_a_door_that_starts_above_ground_is_left_alone():
+    prism, cam = _prism(), _camera(0, -40, 0.0)
+    mask = _mask(prism, cam)
+    r, = _place(prism, cam, mask, [_on_south("d", cam, mask, cx=0.0, z0=0.4, w=2.0, h=2.5, type_="door")]).openings
+    assert r["ground_clamp_m"] is None and r["bottom_above_ground_m"] == pytest.approx(0.4, abs=0.05)
+    assert r["height_m"] == pytest.approx(2.5, abs=0.05)

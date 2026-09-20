@@ -120,6 +120,7 @@ async function show(assetId) {
       viewer.entities.removeAll();        // nothing uses entities any more
       viewer.scene.primitives.removeAll();
       texturedModels = {};
+      texturedRec = null;
       openingPrims = [];
       openingsById = new Map();
       showOpeningInfo(undefined);
@@ -315,17 +316,29 @@ function drawFootprintPrism(rec, ground) {
  * Returns true when at least one model is on screen.
  */
 let texturedModels = {};
+let texturedRec = null; // the record whose textures are on screen
+let texturedFrame = null; // its enuToFixed, kept so the AI twins can be loaded later
+let textureVariant = 'photo'; // 'photo' | 'scorched'
+let aiOverlay = false; // show the twin whose AI-filled texels are tinted
+
+async function loadTexturedModel(rec, enuToFixed, key, file) {
+  const model = await Cesium.Model.fromGltfAsync({
+    url: `/assets-data/${rec.asset_id}/${file}`,
+    modelMatrix: enuToFixed,
+    upAxis: Cesium.Axis.Z,
+    forwardAxis: Cesium.Axis.X,
+  });
+  return model;
+}
 
 async function drawTexturedPrism(rec, enuToFixed, stillCurrent) {
   texturedModels = {};
+  texturedRec = rec;
+  texturedFrame = enuToFixed;
+  aiOverlay = false;
   for (const [key, file] of Object.entries(rec.textured_glbs || {})) {
     try {
-      const model = await Cesium.Model.fromGltfAsync({
-        url: `/assets-data/${rec.asset_id}/${file}`,
-        modelMatrix: enuToFixed,
-        upAxis: Cesium.Axis.Z,
-        forwardAxis: Cesium.Axis.X,
-      });
+      const model = await loadTexturedModel(rec, enuToFixed, key, file);
       if (!stillCurrent()) {
         model.destroy?.();
         return false;
@@ -337,26 +350,66 @@ async function drawTexturedPrism(rec, enuToFixed, stillCurrent) {
       console.warn(`textured prism "${key}" failed to load`, e);
     }
   }
-  const first = texturedModels.photo ? 'photo' : Object.keys(texturedModels)[0];
-  if (!first) return false;
-  texturedModels[first].show = true;
+  textureVariant = texturedModels.photo ? 'photo' : Object.keys(texturedModels)[0];
+  if (!textureVariant) return false;
+  texturedModels[textureVariant].show = true;
   return true;
 }
 
-/** Photo <-> Scorched switch at the top of the panel (call after renderPanel, which rewrites the panel). */
+/** Show the model for the current variant, or its AI-tinted twin (loaded the first time it is asked for). The twin is
+ *  the same building with the texels FLUX Fill generated painted magenta (perception/prism_texture.py writes it as
+ *  prism_<variant>_ai.glb and lists it in rec.textured_glbs_ai). */
+async function showTextured() {
+  const rec = texturedRec;
+  const twinFile = rec?.textured_glbs_ai?.[textureVariant];
+  const wanted = aiOverlay && twinFile ? `${textureVariant}_ai` : textureVariant;
+  if (!texturedModels[wanted] && twinFile && wanted.endsWith('_ai')) {
+    try {
+      const model = await loadTexturedModel(rec, texturedFrame, wanted, twinFile);
+      if (texturedRec !== rec) {
+        model.destroy?.();
+        return;
+      }
+      model.show = false;
+      viewer.scene.primitives.add(model);
+      texturedModels[wanted] = model;
+    } catch (e) {
+      console.warn('AI overlay failed to load', e);
+      return;
+    }
+  }
+  for (const [key, model] of Object.entries(texturedModels)) model.show = key === wanted;
+}
+
+/** Photo <-> Scorched switch and the "AI-filled" overlay at the top of the panel (call after renderPanel, which
+ *  rewrites the panel). The overlay is offered only when the record has AI-filled regions to show. */
 function renderTextureToggle() {
   if (!Object.keys(texturedModels).length) return;
-  const shown = Object.keys(texturedModels).find((k) => texturedModels[k].show);
   const button = (key, label) => `<button data-tex="${key}"${texturedModels[key] ? '' : ' disabled'}
-    style="margin-right:6px;font-weight:${key === shown ? 'bold' : 'normal'}">${label}</button>`;
+    style="margin-right:6px;font-weight:${key === textureVariant ? 'bold' : 'normal'}">${label}</button>`;
+  const twins = texturedRec?.textured_glbs_ai || {};
+  const overlay = Object.keys(twins).length
+    ? `<div style="margin-top:4px"><label><input type="checkbox" id="ai-overlay"${twins[textureVariant] ? '' : ' disabled'}>
+       AI-filled overlay</label> <small>(tints what FLUX Fill generated)</small></div>`
+    : '';
   metaEl.insertAdjacentHTML('afterbegin',
-    `<div class="flags"><b>texture</b><div>${button('photo', 'Photo')}${button('scorched', 'Scorched')}</div></div>`);
+    `<div class="flags"><b>texture</b><div>${button('photo', 'Photo')}${button('scorched', 'Scorched')}</div>${overlay}</div>`);
   metaEl.querySelectorAll('button[data-tex]').forEach((b) => b.addEventListener('click', () => {
-    for (const [key, model] of Object.entries(texturedModels)) model.show = key === b.dataset.tex;
+    textureVariant = b.dataset.tex;
     metaEl.querySelectorAll('button[data-tex]').forEach((x) => {
       x.style.fontWeight = x === b ? 'bold' : 'normal';
     });
+    const box = document.getElementById('ai-overlay');
+    if (box) box.disabled = !twins[textureVariant];
+    showTextured();
   }));
+  const box = document.getElementById('ai-overlay');
+  if (box) {
+    box.addEventListener('change', () => {
+      aiOverlay = box.checked;
+      showTextured();
+    });
+  }
 }
 
 /**
@@ -384,8 +437,8 @@ function drawOpenings(rec, enuToFixed) {
     (o) => o.position_enu && o.normal_enu && o.width_m && o.height_m,
   );
   if (!items.length) return;
-  const fills = [];
-  const lines = [];
+  // Two groups: ACCEPT markers (shown) and REVIEW markers (hidden until "Show review" is ticked).
+  const groups = { accepted: { fills: [], lines: [] }, review: { fills: [], lines: [] } };
   for (const o of items) {
     openingsById.set(o.id, o);
     const [nx, ny] = o.normal_enu;
@@ -394,7 +447,8 @@ function drawOpenings(rec, enuToFixed) {
     const modelMatrix = Cesium.Matrix4.multiply(enuToFixed, local, new Cesium.Matrix4());
     const typeColour = Cesium.Color.fromCssColorString(OPENING_COLOURS[o.type] || OPENING_FALLBACK);
     const review = o.decision === 'REVIEW';
-    fills.push(new Cesium.GeometryInstance({
+    const group = review ? groups.review : groups.accepted;
+    group.fills.push(new Cesium.GeometryInstance({
       id: o.id,
       geometry: Cesium.BoxGeometry.fromDimensions({
         dimensions: new Cesium.Cartesian3(o.width_m, o.height_m, 0.1),
@@ -405,7 +459,7 @@ function drawOpenings(rec, enuToFixed) {
     }));
     const outline = review ? Cesium.Color.fromCssColorString(REVIEW_RED) : typeColour;
     for (const grow of review ? REVIEW_OUTLINE_GROW : [0]) {
-      lines.push(new Cesium.GeometryInstance({
+      group.lines.push(new Cesium.GeometryInstance({
         id: o.id,
         geometry: Cesium.BoxOutlineGeometry.fromDimensions({
           dimensions: new Cesium.Cartesian3(o.width_m + grow, o.height_m + grow, 0.1 + grow),
@@ -415,22 +469,27 @@ function drawOpenings(rec, enuToFixed) {
       }));
     }
   }
-  const primitives = [
-    new Cesium.Primitive({
-      geometryInstances: fills,
-      appearance: new Cesium.PerInstanceColorAppearance({ translucent: true }),
-      asynchronous: false,
-    }),
-    new Cesium.Primitive({
-      geometryInstances: lines,
-      // No renderState.lineWidth: WebGL on Windows allows 1 only, and anything else is a hard DeveloperError.
-      appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: false }),
-      asynchronous: false,
-    }),
-  ];
-  for (const p of primitives) {
-    viewer.scene.primitives.add(p);
-    openingPrims.push(p);
+  for (const [name, { fills, lines }] of Object.entries(groups)) {
+    if (!fills.length) continue;
+    const primitives = [
+      new Cesium.Primitive({
+        geometryInstances: fills,
+        appearance: new Cesium.PerInstanceColorAppearance({ translucent: true }),
+        asynchronous: false,
+      }),
+      new Cesium.Primitive({
+        geometryInstances: lines,
+        // No renderState.lineWidth: WebGL on Windows allows 1 only, and anything else is a hard DeveloperError.
+        appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: false }),
+        asynchronous: false,
+      }),
+    ];
+    for (const prim of primitives) {
+      prim.isReview = name === 'review';
+      prim.show = !prim.isReview;
+      viewer.scene.primitives.add(prim);
+      openingPrims.push(prim);
+    }
   }
 }
 
@@ -516,7 +575,15 @@ function viewFromPhoto(rec) {
   });
 }
 
-/** "Markers" on/off and the colour legend at the top of the panel (call after renderPanel, which rewrites it). */
+/** "N accepted · M in review", from the record (which also counts the openings too uncertain to draw). */
+function openingCounts(rec) {
+  const all = rec.openings || [];
+  const review = all.filter((o) => o.decision === 'REVIEW').length;
+  return { accepted: all.length - review, review };
+}
+
+/** "Markers" on/off, "Show review", the counts and the colour legend at the top of the panel (call after renderPanel,
+ *  which rewrites it). REVIEW markers stay hidden until asked for. */
 function renderMarkerControls(rec) {
   const notice = withheldNotice(rec);
   if (notice) {
@@ -524,6 +591,7 @@ function renderMarkerControls(rec) {
     return;
   }
   if (!openingPrims.length) return;
+  const { accepted, review } = openingCounts(rec);
   const swatch = (css, label, border = 2) => `<span style="display:inline-block;margin:0 10px 2px 0;white-space:nowrap">`
     + `<span style="display:inline-block;width:10px;height:10px;box-sizing:content-box;border:${border}px solid ${css};`
     + `background:${css}40;margin-right:4px;vertical-align:-2px"></span>${label}</span>`;
@@ -531,12 +599,18 @@ function renderMarkerControls(rec) {
     .map(([type, label]) => swatch(OPENING_COLOURS[type], label)).join('')
     + swatch(REVIEW_RED, 'red outline = needs review', 3);
   metaEl.insertAdjacentHTML('afterbegin',
-    `<div class="flags"><label><input type="checkbox" id="markers-on" checked> <b>Markers</b></label>`
+    `<div class="flags"><label><input type="checkbox" id="markers-on" checked> <b>Markers</b></label> `
+    + `<label style="margin-left:12px"><input type="checkbox" id="show-review"> Show review</label>`
+    + `<div id="opening-counts" style="margin-top:4px">${accepted} accepted &middot; ${review} in review</div>`
     + `<div style="margin-top:4px;font-size:12px">${legend}</div></div>`);
-  document.getElementById('markers-on').addEventListener('change', (e) => {
-    for (const p of openingPrims) p.show = e.target.checked;
-    if (!e.target.checked) showOpeningInfo(undefined);
-  });
+  const apply = () => {
+    const on = document.getElementById('markers-on').checked;
+    const withReview = document.getElementById('show-review').checked;
+    for (const prim of openingPrims) prim.show = on && (!prim.isReview || withReview);
+    if (!on) showOpeningInfo(undefined);
+  };
+  document.getElementById('markers-on').addEventListener('change', apply);
+  document.getElementById('show-review').addEventListener('change', apply);
 }
 
 /**
@@ -692,6 +766,7 @@ clearEl.addEventListener('click', () => {
   viewer.entities.removeAll();
   viewer.scene.primitives.removeAll();
   texturedModels = {};
+  texturedRec = null;
   openingPrims = [];
   openingsById = new Map();
   drawn.length = 0;

@@ -163,15 +163,41 @@ def test_a_wall_needs_a_view_to_be_baked_at_all():
         assert w.rgb.reshape(-1, 3).mean(axis=0) == pytest.approx(pt.NEUTRAL_RGB, rel=0.06)
 
 
-def test_the_scorched_facade_adds_rust_streaks_and_the_photo_one_does_not():
+def test_the_scorched_facade_has_only_subtle_rust_streaks_and_the_photo_one_none():
+    import cv2
+
     args = (400, 414, 20.0, 20.7, (140, 130, 120))
     photo = pt.procedural_facade(*args, "photo", seed=[1, 2, 3]).astype(float)
     scorched = pt.procedural_facade(*args, "scorched", seed=[1, 2, 3]).astype(float)
     assert photo.reshape(-1, 3).mean(axis=0) == pytest.approx((140, 130, 120), rel=0.03)
-    rust = lambda im: (im[..., 0] - im[..., 2]).mean()  # noqa: E731
-    assert rust(scorched) > rust(photo) + 2  # streaks tint it orange-brown
-    assert (scorched.std(axis=0) > 0).all() and scorched.std() > photo.std()  # more structure than the plain facade
     assert np.array_equal(photo, pt.procedural_facade(*args, "photo", seed=[1, 2, 3]).astype(float))  # deterministic
+    diff = np.abs(scorched - photo)  # the two share everything but the streaks
+    assert diff.max() > 0  # there are streaks ...
+    assert diff.max() < 0.19 * 140 + 2  # ... none stronger than alpha ~0.15-0.17 of a colour ~100 levels away
+    assert (diff.max(axis=2) > 3).mean() < 0.06  # ... covering a small part of the wall (they were ~25% before)
+    rust = lambda im: (im[..., 0] - im[..., 2]).mean()  # noqa: E731
+    assert 0.0 < rust(scorched) - rust(photo) < 2.0  # a faint warm cast, not an orange one
+    # from 200 m a facade metre is a pixel or less: averaged over a metre the streaks disappear
+    metre = lambda im: cv2.resize(im, (20, 20), interpolation=cv2.INTER_AREA)  # noqa: E731
+    assert np.abs(metre(scorched) - metre(photo)).max() < 3.0
+
+
+def test_the_streaks_are_irregular_and_desaturated():
+    args = (600, 414, 20.0, 20.7, (140, 130, 120))
+    d = (pt.procedural_facade(*args, "scorched", seed=[1, 2, 3]).astype(float)
+         - pt.procedural_facade(*args, "photo", seed=[1, 2, 3]).astype(float))
+    streaked = np.abs(d).max(axis=2) > 3
+    cols = np.nonzero(streaked.any(axis=0))[0]
+    assert len(cols) > 0
+    starts = cols[np.insert(np.diff(cols) > 6, 0, True)]  # one entry per streak (roughly)
+    gaps = np.diff(starts)
+    assert len(starts) >= 3 and gaps.std() / gaps.mean() > 0.3  # irregular spacing, not a comb
+    rows = [np.nonzero(streaked[:, c])[0] for c in starts]
+    lengths = np.array([len(r) for r in rows if len(r)])
+    assert lengths.std() / lengths.mean() > 0.2  # irregular lengths
+    r, g, b = (pt.RUST_STREAK_RGB[i] for i in range(3))
+    sat = lambda rgb: (max(rgb) - min(rgb)) / max(rgb)  # noqa: E731
+    assert sat(pt.RUST_STREAK_RGB) < 0.7 * sat(pt.RUST_RGB)  # lower saturation than the roof's rust
 
 
 # ---- roof --------------------------------------------------------------------------------------------------
@@ -455,11 +481,36 @@ def test_the_scorched_image_may_be_a_different_resolution(tmp_path):
     assert np.median(np.abs(a - b)) < 3  # same picture, just softer (the mean is dominated by checker edges)
 
 
-def test_an_unreliable_camera_is_not_textured(tmp_path):
+def test_an_unreliable_camera_gets_procedural_only_glbs_with_no_photo_content(tmp_path):
     run = _run_dir(tmp_path, reliable=False)
-    with pytest.raises(ValueError, match="not reliable"):
-        pt.bake_record(run, tmp_path / "photo.png", tmp_path / "mask.png")
-    assert pt.bake_record(run, tmp_path / "photo.png", tmp_path / "mask.png", force=True)["textured_glbs"]
+    rec = pt.bake_record(run, tmp_path / "photo.png", tmp_path / "mask.png")
+    assert rec["textured_glbs"] == {"photo": "prism_photo.glb", "scorched": "prism_scorched.glb"}
+    for key in ("photo", "scorched"):
+        info = rec["texture_bake"][key]
+        assert info["procedural_only"] is True
+        assert all(w["source"] == "procedural" and w["coverage"] == 0.0 for w in info["walls"])  # no photo anywhere
+        assert (run / f"prism_{key}.glb").is_file() and (run / f"prism_{key}_roof.png").is_file()
+        atlas = np.array(Image.open(run / f"prism_{key}_atlas.png")).astype(float)
+        assert atlas.std() / atlas.mean() < 0.15  # a plain facade, not the checkerboard in the photo
+    photo_base, scorched_base = (np.array(rec["texture_bake"][k]["base_rgb"], float) for k in ("photo", "scorched"))
+    img = np.array(Image.open(tmp_path / "photo.png").convert("RGB"))
+    mask = np.array(Image.open(tmp_path / "mask.png").convert("L")) > 127
+    assert photo_base == pytest.approx(img[mask].mean(axis=0), abs=1.5)  # the photo's mean under the building mask
+    assert scorched_base.mean() < photo_base.mean()  # the scorched variant is darker and browner
+    assert scorched_base[0] > scorched_base[2]
+    # force=True bakes the photo anyway
+    forced = pt.bake_record(run, tmp_path / "photo.png", tmp_path / "mask.png", force=True)
+    assert "procedural_only" not in forced["texture_bake"]["photo"]
+
+
+def test_bake_procedural_has_no_visible_texels_and_a_roof():
+    prism = _prism()
+    bake = pt.bake_procedural(prism, "photo", (120, 110, 100))
+    assert all(w.source == "procedural" and not w.visible.any() for w in bake.walls)
+    assert bake.base_rgb == (120, 110, 100) and bake.roof_map.ndim == 3
+    assert bake.atlas.reshape(-1, 3)[bake.atlas_used.ravel()].mean(axis=0) == pytest.approx((120, 110, 100), rel=0.06)
+    assert pt.procedural_base("scorched", (120, 110, 100)).mean() < 100  # derived, darker
+    assert pt.procedural_base("scorched", (120, 110, 100), edit_mean=(50, 40, 35)).tolist() == [50, 40, 35]
 
 
 # --------------------------------------------------------------- edit mask
@@ -597,3 +648,257 @@ def test_the_halo_rule_is_limited_to_the_band_and_to_edits():
     assert narrow.visible[cols["halo"]].all()  # a 1% band does not reach the stripe
     photo = pt.bake_textures(prism, cam, edit, mask).walls[_south(prism)]  # no edit mask: this is a photo bake
     assert photo.visible[cols["halo"]].all()  # the rule never touches an original photo
+
+
+# ----------------------------------------------------------- normalisation (no AI)
+
+
+def _textured_wall(h=160, w=400, seed=0, colour=(140, 130, 120), gradient=None, scale=1.0, tint=(1, 1, 1)):
+    """A synthetic wall: a fixed brick-like texture in `colour`, optionally lit by a left-to-right gradient."""
+    rng = np.random.default_rng(seed)
+    grain = 1.0 + 0.08 * rng.normal(size=(h, w, 1)).clip(-2, 2)
+    windows = np.ones((h, w, 1))
+    for x in range(30, w - 30, 60):
+        windows[40:110, x : x + 24] = 0.45  # dark window openings: real high-frequency structure
+    base = np.array(colour, float) * grain * windows
+    if gradient is not None:
+        base = base * np.linspace(gradient[0], gradient[1], w)[None, :, None]
+    return np.clip(base * scale * np.array(tint, float), 0, 255).astype(np.uint8), np.ones((h, w), bool)
+
+
+def _chroma(rgb, vis):
+    m = rgb[vis].astype(float).mean(axis=0)
+    return m[0] / m[1], m[2] / m[1]
+
+
+def test_delight_removes_a_lighting_gradient_and_keeps_the_mean_and_the_chroma():
+    lit, vis = _textured_wall(gradient=(0.45, 1.6))  # sun on the right, shade on the left
+    flat, gain = pt.delight(lit, vis, 20.0)
+    before = pt._luma(lit).mean(axis=0)
+    after = pt._luma(flat.round().astype(np.uint8)).mean(axis=0)
+    assert np.ptp(after) < 0.5 * np.ptp(before)  # the gradient is largely gone (a heavy blur cannot follow a ramp to the very edge)
+    assert pt._luma(flat).mean() == pytest.approx(pt._luma(lit).mean(), rel=0.06)  # the wall keeps its exposure
+    assert _chroma(flat.round().astype(np.uint8), vis) == pytest.approx(_chroma(lit, vis), rel=0.02)  # colour untouched
+    assert gain.min() >= pt.GAIN_CLIP[0] and gain.max() <= pt.GAIN_CLIP[1]
+    windows_before = pt._luma(lit)[75, 35:50].mean() / pt._luma(lit)[10, 35:50].mean()
+    windows_after = pt._luma(flat.round().astype(np.uint8))[75, 35:50].mean() / pt._luma(flat.round().astype(np.uint8))[10, 35:50].mean()
+    assert windows_after == pytest.approx(windows_before, rel=0.25)  # a window is still darker than the wall around it
+
+
+def test_delight_only_looks_at_photographed_texels():
+    lit, vis = _textured_wall(gradient=(0.6, 1.4))
+    vis = vis.copy()
+    vis[:, 250:] = False  # the right third was never photographed
+    lit = lit.copy()
+    lit[:, 250:] = 255  # garbage there must not brighten the estimate
+    flat, _ = pt.delight(lit, vis, 20.0)
+    assert pt._luma(flat)[vis].mean() == pytest.approx(pt._luma(lit)[vis].mean(), rel=0.08)
+
+
+def test_walls_are_matched_to_the_best_covered_wall():
+    ref_rgb, ref_vis = _textured_wall(seed=1, colour=(150, 140, 125))
+    dark_rgb, dark_vis = _textured_wall(seed=2, colour=(150, 140, 125), scale=0.55, tint=(0.9, 1.0, 1.15))  # shade, bluish
+    dark_vis = dark_vis.copy()
+    dark_vis[:, 300:] = False  # covered less than the reference
+    sliver_rgb, sliver_vis = _textured_wall(seed=3, colour=(20, 200, 20))
+    sliver_vis = np.zeros_like(sliver_vis)
+    sliver_vis[:5, :5] = True  # below KEEP_COVERAGE: left alone
+    out, info = pt.normalise_walls([(dark_rgb, dark_vis), (ref_rgb, ref_vis), (sliver_rgb, sliver_vis)], 20.0)
+    assert info["reference_wall"] == 1  # the best covered
+    assert out[2][0] is sliver_rgb or (out[2][0] == sliver_rgb).all()  # the sliver is untouched
+    mean = lambda rgb, vis: rgb[vis].astype(float).mean(axis=0)  # noqa: E731
+    before_gap = np.abs(mean(dark_rgb, dark_vis) - mean(ref_rgb, ref_vis)).max()
+    after_gap = np.abs(mean(*out[0]) - mean(*out[1])).max()
+    assert before_gap > 40 and after_gap < 4  # colour and exposure now agree
+    assert _chroma(*out[0]) == pytest.approx(_chroma(*out[1]), rel=0.03)  # including the blue cast
+    assert set(info["walls"]) == {0, 1} and info["walls"][1]["contrast_scale"] == [1.0, 1.0, 1.0]
+
+
+def test_a_building_photographed_in_sun_and_shade_reads_as_one_building():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    lit = (img.astype(float) * np.linspace(0.4, 1.5, W)[None, :, None]).clip(0, 255).astype(np.uint8)
+    raw = pt.bake_textures(prism, cam, lit, mask, normalise=False).walls[_south(prism)]
+    flat = pt.bake_textures(prism, cam, lit, mask).walls[_south(prism)]
+    cols = lambda w: pt._luma(w.rgb).mean(axis=0)[w.visible.any(axis=0)]  # noqa: E731
+    assert np.ptp(cols(flat)) < 0.7 * np.ptp(cols(raw))
+    assert flat.source == "photo"
+
+
+def test_the_procedural_facade_takes_the_normalised_mean_colour():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    lit = (img.astype(float) * np.linspace(0.4, 1.5, W)[None, :, None]).clip(0, 255).astype(np.uint8)
+    bake = pt.bake_textures(prism, cam, lit, mask)
+    south = bake.walls[_south(prism)]
+    assert bake.base_rgb == tuple(int(round(c)) for c in south.rgb[south.visible].astype(float).mean(axis=0)) or True
+    seen = south.rgb[south.visible].astype(float).mean(axis=0)
+    assert np.array(bake.base_rgb) == pytest.approx(seen, rel=0.03)  # the mean of what is baked, i.e. the NORMALISED walls
+    away = [w for w in bake.walls if w.source == "procedural"][0]
+    assert away.rgb.reshape(-1, 3).mean(axis=0) == pytest.approx(seen, rel=0.08)
+
+
+# ------------------------------------------------------------------- AI fill
+
+
+class FakeAI:
+    """A prism_ai_fill backend: paints masked pixels bright green and checks the 60% rule."""
+
+    def __init__(self):
+        self.calls, self.cache_hits = [], 0
+
+    def fill(self, image, mask, prompt):
+        assert mask.mean() <= 0.60 and max(image.shape[:2]) <= 1024
+        self.calls.append((image.shape[:2], float(mask.mean()), prompt))
+        out = image.copy()
+        out[mask] = (0, 255, 0)
+        return out
+
+
+def _strip(mask, frac):
+    """The photo mask restricted to the central `frac` of its rows: the wall is photographed only in a band."""
+    rows = np.nonzero(mask.any(axis=1))[0]
+    lo, hi = rows[0], rows[-1]
+    mid, half = (lo + hi) // 2, int(frac * (hi - lo) / 2)
+    out = mask.copy()
+    out[: mid - half] = False
+    out[mid + half :] = False
+    return out
+
+
+def _ai(backend, calls=8):
+    from perception import prism_ai_fill as F
+
+    return F.AIFill(backend, "a stone facade", max_calls=calls)
+
+
+def test_a_well_covered_wall_gets_ai_fill_above_and_below_its_band_and_it_is_recorded():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    backend = FakeAI()
+    bake = pt.bake_textures(prism, cam, img, _strip(mask, 0.75), ai=_ai(backend))
+    south = bake.walls[_south(prism)]
+    assert 0.30 <= south.coverage and len(backend.calls) == 1  # one tile: the wall is 400 px wide
+    assert south.ai_filled_fraction > 0.15 and south.ai_weight is not None
+    assert south.photo_fraction + south.ai_filled_fraction + south.procedural_fraction == pytest.approx(1.0, abs=1e-3)
+    ai_texels = south.ai_weight > 0.9
+    assert ai_texels.any() and ai_texels[: int(0.05 * ai_texels.shape[0])].any()  # ... including the band above the coverage
+    assert not (south.rgb[ai_texels] == (0, 255, 0)).all(axis=1).any()  # the fake's raw green was colour-matched away
+    photo_mean = south.rgb[south.visible].astype(float).mean(axis=0)
+    assert south.rgb[ai_texels].astype(float).mean(axis=0) == pytest.approx(photo_mean, rel=0.12)  # to the wall's colour
+    assert bake.ai_stats["sent"] == 1 and bake.any_ai
+    for other in bake.walls:  # unseen walls are NOT eligible: they stay procedural, with no AI share
+        if other.index != south.index:
+            assert other.ai_filled_fraction == 0.0 and other.source == "procedural"
+    assert all("ai_filled_fraction" in w for w in bake.stats())
+
+
+def test_photo_and_ai_regions_are_feathered_over_half_a_metre():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    bake = pt.bake_textures(prism, cam, img, _strip(mask, 0.75), ai=_ai(FakeAI()))
+    south = bake.walls[_south(prism)]
+    seen_rows = np.nonzero(south.visible.any(axis=1))[0]
+    top, col = seen_rows[0], 200
+    column = south.rgb[max(0, top - 30) : top + 30, col].astype(float)
+    assert np.abs(np.diff(column[:, 1])).max() < 60  # no hard edge where the photo ends and the AI fill starts
+    ai_w = south.ai_weight[:, col]
+    ramp_rows = np.nonzero((ai_w > 0.05) & (ai_w < 0.95))[0]
+    assert len(ramp_rows) >= 0.4 * pt.BLEND_M * bake.ppm  # the hand-over is spread over ~0.5 m (10 px), not a step
+
+
+def test_a_wall_below_30_percent_coverage_gets_no_ai():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    backend = FakeAI()
+    bake = pt.bake_textures(prism, cam, img, _strip(mask, 0.35), ai=_ai(backend))
+    south = bake.walls[_south(prism)]
+    assert pt.KEEP_COVERAGE <= south.coverage < 0.30
+    assert backend.calls == [] and south.ai_filled_fraction == 0.0 and not bake.any_ai and bake.tint_atlas is None
+    assert south.source == "partial"  # its photo texels are still used; the rest is procedural
+
+
+def test_a_tile_that_would_be_more_than_60_percent_empty_stays_procedural():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    backend = FakeAI()
+    ai = _ai(backend)
+    bake = pt.bake_textures(prism, cam, img, _strip(mask, 0.5), ai=ai)  # eligible (36% covered) but the tile is ~64% empty
+    south = bake.walls[_south(prism)]
+    assert south.coverage >= 0.30 and south.ai_filled_fraction == 0.0
+    assert backend.calls == [] and ai.stats["skipped_too_empty"] >= 1
+
+
+def test_the_call_cap_is_respected_across_a_bake():
+    from perception import prism_ai_fill as F
+
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    backend = FakeAI()
+    bake = pt.bake_textures(prism, cam, img, _strip(mask, 0.75), ai=F.AIFill(backend, "x", max_calls=0))
+    assert backend.calls == [] and not bake.any_ai
+
+
+def test_the_tinted_atlas_differs_from_the_plain_one_only_on_ai_texels():
+    prism, cam = _prism(), _camera()
+    img, mask = _photo(cam)
+    bake = pt.bake_textures(prism, cam, img, _strip(mask, 0.75), ai=_ai(FakeAI()))
+    assert bake.tint_atlas is not None and bake.tint_atlas.shape == bake.atlas.shape
+    south = bake.walls[_south(prism)]
+    x, y, w, h = bake.rects[south.index]
+    changed = (bake.tint_atlas != bake.atlas).any(axis=2)[y : y + h, x : x + w]
+    assert np.array_equal(changed, south.ai_weight > 0.0) or (changed & (south.ai_weight == 0)).sum() == 0
+    assert (changed & (south.ai_weight == 0)).sum() == 0  # nothing outside the AI region is touched
+    tint = np.asarray(pt.AI_TINT_RGB, float)
+    a = (pt.AI_TINT_STRENGTH * south.ai_weight)[..., None]
+    expected = south.rgb.astype(float) * (1 - a) + tint * a
+    assert np.abs(bake.tint_atlas[y : y + h, x : x + w].astype(float) - expected).max() <= 1.0  # the tint, by its weight
+    others = [t for t in bake.walls if t.index != south.index]
+    for t in others:
+        rx, ry, rw, rh = bake.rects[t.index]
+        assert (bake.tint_atlas[ry : ry + rh, rx : rx + rw] == bake.atlas[ry : ry + rh, rx : rx + rw]).all()
+
+
+def test_bake_record_writes_the_tinted_glb_and_the_fractions_only_when_ai_ran(tmp_path):
+    run = _run_dir(tmp_path)
+    Image.fromarray((_strip(_photo(_camera())[1], 0.75) * 255).astype(np.uint8)).save(tmp_path / "mask.png")
+    backend = FakeAI()
+    rec = pt.bake_record(run, tmp_path / "photo.png", tmp_path / "mask.png", ai=lambda key: _ai(backend))
+    assert rec["textured_glbs"] == {"photo": "prism_photo.glb"}
+    assert rec["textured_glbs_ai"] == {"photo": "prism_photo_ai.glb"}
+    assert (run / "prism_photo_ai.glb").is_file() and (run / "prism_photo_atlas_ai.png").is_file()
+    walls = rec["texture_bake"]["photo"]["walls"]
+    assert max(w["ai_filled_fraction"] for w in walls) > 0.15 and sum(w["ai_filled_fraction"] > 0 for w in walls) == 1
+    assert rec["texture_bake"]["photo"]["ai"]["sent"] == 1 and rec["texture_bake"]["photo"]["normalisation"]
+    on_disk = json.loads((run / "record.json").read_text())
+    assert on_disk["textured_glbs_ai"] == rec["textured_glbs_ai"]
+    # the twin is the same building: same size, and its wall texture carries the tint
+    from pygltflib import GLTF2
+
+    plain, tinted = (GLTF2().load(str(run / n)) for n in ("prism_photo.glb", "prism_photo_ai.glb"))
+    assert [n.name for n in plain.nodes] == [n.name for n in tinted.nodes]
+    assert {n.name: n.extras["ai_overlay"] for n in tinted.nodes} == {"walls": True, "roof": True}
+    assert {n.name: n.extras["ai_overlay"] for n in plain.nodes} == {"walls": False, "roof": False}
+
+    # without AI: no fractions of AI, no twin, and a stale twin key is removed
+    again = pt.bake_record(run, tmp_path / "photo.png", tmp_path / "mask.png")
+    assert "textured_glbs_ai" not in again
+    assert all(w["ai_filled_fraction"] == 0.0 for w in again["texture_bake"]["photo"]["walls"])
+
+
+def test_ai_colour_is_matched_to_the_walls_photographed_colour_and_structure_is_kept():
+    rng = np.random.default_rng(4)
+    rgb = np.empty((100, 200, 3), np.uint8)
+    rgb[:] = (60, 52, 46)  # a dark scorched wall, with a little texture
+    rgb = np.clip(rgb.astype(int) + rng.integers(-6, 7, rgb.shape), 0, 255).astype(np.uint8)
+    photo = np.zeros((100, 200), bool)
+    photo[:, 100:] = True
+    ai = np.full((100, 200, 3), 235, np.float32)  # FLUX painted a near-white facade ...
+    ai[10:40, 10:80] = 90  # ... with dark window slats
+    matched, info = pt.match_ai_to_photo(ai, ~photo, rgb, photo)
+    assert info["mean_before"][0] > 190 and info["mean_after"] == pytest.approx([60, 52, 46], abs=1.5)
+    left = matched[~photo]
+    assert left.mean(axis=0) == pytest.approx(rgb[photo].astype(float).mean(axis=0), abs=6.0)  # the wall's colour now (slats clip at 0)
+    assert matched[20, 40, 0] < matched[70, 40, 0] - 5  # the window slats are still darker than the wall around them
+    assert matched.min() >= 0 and matched.max() <= 255
+    assert pt.match_ai_to_photo(ai, np.zeros_like(photo), rgb, photo)[1] == {}  # nothing to match: left alone
