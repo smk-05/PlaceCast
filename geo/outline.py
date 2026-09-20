@@ -314,9 +314,20 @@ def ground_outline(vertices_canonical: np.ndarray,
     # keeps a sliver (observed: 11% of an L-shaped plan). Cells no smaller than
     # ~0.75 of the median neighbour spacing keep closing able to fuse neighbours.
     from scipy.spatial import cKDTree
-    sample = xy if len(xy) <= 5000 else xy[np.random.default_rng(0).choice(len(xy), 5000, replace=False)]
-    nn = cKDTree(sample).query(sample, k=2)[0][:, 1]
-    spacing = float(np.median(nn[nn > 0])) if np.any(nn > 0) else 0.0
+    # Spacing must be measured on DISTINCT plan positions. An architectural
+    # model's walls are rows of vertices stacked vertically, which all project
+    # to the same XY: counting them made the cloud look dense, the cell tiny,
+    # and the plan shattered into 305 fragments whose largest was 7% of the
+    # building (a 86 m building came out 5.8 m across). Generated meshes hid
+    # this because their vertices are scattered rather than stacked.
+    uniq = np.unique(np.round(xy / max(size, 1e-9), 6), axis=0) * max(size, 1e-9)
+    sample = uniq if len(uniq) <= 5000 else uniq[
+        np.random.default_rng(0).choice(len(uniq), 5000, replace=False)]
+    if len(sample) >= 2:
+        nn = cKDTree(sample).query(sample, k=2)[0][:, 1]
+        spacing = float(np.median(nn[nn > 0])) if np.any(nn > 0) else 0.0
+    else:
+        spacing = 0.0
     pixel = max(size / grid_cells, 0.75 * spacing)
     close_px = max(3, int(round(close_frac * grid_cells)))
     open_px = max(3, int(round(open_frac * grid_cells)))
