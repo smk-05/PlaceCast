@@ -280,13 +280,19 @@ async function drawBuilding(rec, ground, stillCurrent = () => true) {
     // than the placement. The prism is exact in plan by construction — what it
     // still shows is everything the placement chain contributes: which
     // building, its outline, its height, and the ground it stands on.
-    // SCHEMATIC is the default view: this flat footprint prism, in a neutral solid colour. A record with baked
-    // textures (perception/prism_texture.py) has them loaded here too, but hidden: "Photo texture" and "Scorched"
-    // (both experimental) swap them in for the prism (see applyView).
+    // The default view is PHOTO: the baked photo texture (perception/prism_texture.py). The flat footprint prism (the
+    // "Schematic" view, in a neutral solid colour) is drawn too, hidden behind it, and is what a record with no photo
+    // texture (none baked, or it failed to load) shows instead. "Scorched" and "Schematic" are toggles (see applyView).
     viewMode = 'schematic';
     drawSchematic(rec, ground);
     await drawTexturedPrism(rec, enuToFixed, stillCurrent);
     if (!stillCurrent()) return;
+    if (texturedModels.photo) {
+      viewMode = 'photo';
+      textureVariant = 'photo';
+      for (const prim of schematicPrims) prim.show = false;
+      texturedModels.photo.show = true;
+    }
     openingsCtx = { rec, enuToFixed };
     if (!cameraUnreliable(rec)) drawOpenings(rec, enuToFixed);  // an unreliable fit withholds its markers (panel says so)
   } else {
@@ -321,7 +327,7 @@ function drawFootprintPrism(rec, ground) {
  * toggle flips `show`. The opening markers stand 7 cm proud of the wall plane, so they never z-fight with it.
  * Returns true when at least one model is on screen.
  */
-let viewMode = 'schematic'; // 'schematic' (default) | 'photo' | 'scorched'
+let viewMode = 'photo'; // 'photo' (default; 'schematic' when there is no photo texture) | 'scorched' | 'schematic'
 let schematicPrims = []; // the flat prism's primitives, so a texture view can hide them
 let openingsCtx = null; // { rec, enuToFixed }: what the markers are drawn from, so they can be redrawn on a mode change
 let drawnFillAlpha = 0.6; // the fill alpha the markers were last drawn with
@@ -405,7 +411,7 @@ async function applyView() {
   if (markerFillAlpha() !== drawnFillAlpha) redrawOpenings();
 }
 
-/** The view switch (Schematic / Photo texture / Scorched, the last two experimental) and the "AI-filled" overlay at the
+/** The view switch (Schematic / Photo / Scorched (experimental)) and the "AI-filled" overlay at the
  *  top of the panel (call after renderPanel, which rewrites the panel). Offered only when the record has textures;
  *  the overlay only when it has AI-filled regions to show, and only in a texture view. */
 function renderTextureToggle() {
@@ -419,7 +425,7 @@ function renderTextureToggle() {
        AI-filled overlay</label> <small>(tints what FLUX Fill generated)</small></div>`
     : '';
   metaEl.insertAdjacentHTML('afterbegin',
-    `<div class="flags"><b>view</b><div>${button('schematic', 'Schematic')}${button('photo', 'Photo texture (experimental)')}`
+    `<div class="flags"><b>view</b><div>${button('schematic', 'Schematic')}${button('photo', 'Photo')}`
     + `${button('scorched', 'Scorched (experimental)')}</div>${overlay}</div>`);
   metaEl.querySelectorAll('button[data-tex]').forEach((b) => b.addEventListener('click', () => {
     viewMode = b.dataset.tex;
@@ -458,7 +464,8 @@ let openingPrims = [];
 let openingsById = new Map();
 const defaultFov = viewer.camera.frustum.fov;
 
-/** Marker fill: solid-ish (60%) on the schematic, 25% over a texture so the painted windows show through. */
+/** Marker fill: 25% over a texture (the default view) so the painted windows show through; solid-ish (60%) on the
+ *  schematic. */
 function markerFillAlpha() {
   return viewMode === 'schematic' ? 0.6 : 0.25;
 }
