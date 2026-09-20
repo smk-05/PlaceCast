@@ -126,6 +126,20 @@ def choose_up_axis(vertices: np.ndarray) -> tuple[int, str]:
     lo, hi = float(t.min()), float(t.max())
     if hi - lo < 1e-12:
         return axis_pair * 2, reason
+
+    # A modelled asset is GROUNDED: the artist puts the base on the origin
+    # plane, so one end sits at exactly 0 and the other does not. That beats the
+    # mass test, which reads a detailed roof (parapets, plant, railings) as the
+    # heavy end and turns the building upside down — observed on a downloaded
+    # city block: 6% of vertices in its bottom tenth against 23% in its top,
+    # while its base sat exactly at y = 0. Generated meshes are centred on the
+    # origin, so neither end is 0 and the mass test still decides them.
+    eps = 5e-3 * (hi - lo)
+    if abs(lo) <= eps < abs(hi):
+        return axis_pair * 2, reason + "; base at the origin plane (min end = 0)"
+    if abs(hi) <= eps < abs(lo):
+        return axis_pair * 2 + 1, reason + "; base at the origin plane (max end = 0)"
+
     u = (t - lo) / (hi - lo)
     bottom, top = float(np.mean(u < 0.1)), float(np.mean(u > 0.9))
     # base at the min end -> the positive axis points up
@@ -387,11 +401,60 @@ def ground_outline(vertices_canonical: np.ndarray,
     return outer, holes
 
 
+SURFACE_SAMPLES = 60_000
+
+
+def sample_surface(vertices: np.ndarray, faces: np.ndarray,
+                   n: int = SURFACE_SAMPLES, seed: int = 0) -> np.ndarray:
+    """Area-weighted random points ON the faces. -> (n, 3).
+
+    Spec 6.3 rasterises a point cloud, and taking that cloud from the VERTICES
+    makes the result depend on how the model happens to be tessellated. A
+    generated mesh is dense and scattered, so it works; a modelled asset has
+    large flat walls carrying four vertices each, and the plan then comes out
+    as a handful of specks — a downloaded city block (48 x 27 m) produced a
+    "plan" of 39 m2 covering 13% of its own bounding box. Sampling the surface
+    makes extraction depend on the shape rather than on the mesh topology.
+
+    Deterministic for a given seed (spec 14).
+    """
+    v = np.asarray(vertices, dtype=float)
+    f = np.asarray(faces, dtype=np.int64)
+    if len(f) == 0:
+        return v
+    tri = v[f]
+    # Twice the triangle area, via the cross product of two edges.
+    areas = 0.5 * np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    total = float(areas.sum())
+    if not np.isfinite(total) or total <= 0:
+        return v
+
+    rng = np.random.default_rng(seed)
+    pick = rng.choice(len(f), size=int(n), p=areas / total)
+    # Uniform barycentric coordinates: reflect the unit square into a triangle.
+    u, w = rng.random(int(n)), rng.random(int(n))
+    over = u + w > 1.0
+    u[over], w[over] = 1.0 - u[over], 1.0 - w[over]
+    a, b, c = tri[pick, 0], tri[pick, 1], tri[pick, 2]
+    pts = a + u[:, None] * (b - a) + w[:, None] * (c - a)
+    # Keep the vertices too: corners and fine detail carry the silhouette.
+    return np.vstack([v, pts])
+
+
 def build_mesh_outline(vertices: np.ndarray,
                        *,
+                       faces: np.ndarray | None = None,
                        up_axis_idx: int | None = None,
                        footprint_aspect: float = 1.0) -> MeshOutline:
-    """Full 6.1 -> 6.4 chain. -> MeshOutline, ready for the solve."""
+    """Full 6.1 -> 6.4 chain. -> MeshOutline, ready for the solve.
+
+    `faces` is optional but strongly preferred: with it the outline comes from
+    the mesh's SURFACE rather than from its vertex cloud, which is what makes
+    the result independent of tessellation (see sample_surface).
+    """
+    if faces is not None:
+        vertices = sample_surface(np.asarray(vertices, dtype=float), faces)
     if up_axis_idx is None:
         up_axis_idx, _ = choose_up_axis(np.asarray(vertices, dtype=float))
 

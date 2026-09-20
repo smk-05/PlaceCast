@@ -56,6 +56,9 @@ const terrainReady = (async () => {
 viewer.scene.globe.depthTestAgainstTerrain = true;
 
 const runsEl = document.getElementById('runs');
+const keepEl = document.getElementById('keep');
+const clearEl = document.getElementById('clear');
+const sceneEl = document.getElementById('scene');
 const metaEl = document.getElementById('meta');
 const errEl = document.getElementById('err');
 
@@ -85,9 +88,22 @@ async function loadRuns() {
 // soon as a newer one starts, so only the newest load ever touches the scene.
 let showToken = 0;
 
+// Compare mode: with "keep on map" ticked, selecting another run ADDS it to
+// the scene instead of replacing it, so two placements stand side by side —
+// a generated mesh next to a bought model, say. The line under the panel says
+// what is currently drawn.
+const drawn = [];
+
+function renderScene() {
+  sceneEl.innerHTML = drawn.length > 1
+    ? `on the map: ${drawn.map((d) => `<b>${d}</b>`).join(' + ')}`
+    : '';
+}
+
 async function show(assetId) {
   const token = ++showToken;
   errEl.textContent = '';
+  const keep = keepEl.checked;
   try {
     const rec = await (await fetch(`/api/runs/${assetId}`)).json();
     if (token !== showToken) return;
@@ -100,12 +116,18 @@ async function show(assetId) {
     if (token !== showToken) return;
     rec._ground = ground;
 
-    viewer.entities.removeAll();          // nothing uses entities any more
-    viewer.scene.primitives.removeAll();
-    texturedModels = {};
-    openingPrims = [];
-    openingsById = new Map();
-    showOpeningInfo(undefined);
+    if (!keep) {
+      viewer.entities.removeAll();        // nothing uses entities any more
+      viewer.scene.primitives.removeAll();
+      texturedModels = {};
+      openingPrims = [];
+      openingsById = new Map();
+      showOpeningInfo(undefined);
+      drawn.length = 0;
+    }
+    const label = rec.address_raw.split(',')[0];
+    if (!drawn.includes(label)) drawn.push(label);
+    renderScene();
 
     drawFootprint(rec, ground);
     await drawBuilding(rec, ground, () => token === showToken);
@@ -114,7 +136,7 @@ async function show(assetId) {
     renderMarkerControls(rec);
     renderPhotoViewButton(rec);
     renderTextureToggle();
-    flyTo(rec);
+    if (!keep) flyTo(rec);     // comparing: leave the camera where it is
   } catch (e) {
     if (token !== showToken) return;
     console.error(e);
@@ -666,6 +688,15 @@ function flyTo(rec) {
 }
 
 runsEl.addEventListener('change', (e) => show(e.target.value));
+clearEl.addEventListener('click', () => {
+  viewer.entities.removeAll();
+  viewer.scene.primitives.removeAll();
+  texturedModels = {};
+  openingPrims = [];
+  openingsById = new Map();
+  drawn.length = 0;
+  renderScene();
+});
 document.getElementById('fly').addEventListener('click', () => current && flyTo(current));
 
 loadRuns();

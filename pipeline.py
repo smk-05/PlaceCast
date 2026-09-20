@@ -67,7 +67,8 @@ def run(address: str,
         mask_for_generation: bool = True,
         force_candidate: int | None = None,
         conform: bool = False,
-        lifter: str = "trellis") -> PlacementRecord:
+        lifter: str = "trellis",
+        mesh_path: Path | None = None) -> PlacementRecord:
 
     asset_id = asset_id or str(uuid.uuid4())
     run_dir = DATA_DIR / asset_id
@@ -108,7 +109,22 @@ def run(address: str,
     # -- 5 generation -------------------------------------------------------
     mesh_vertices = None
     models: list[dict] = []
-    if not dry_run and photos:
+    if mesh_path is not None:
+        # Bring your own model: skip generation entirely and place a mesh that
+        # already exists (a bought or downloaded asset, or one this pipeline
+        # made earlier). Everything after this point is unchanged, which is the
+        # point - the solver never knew where its mesh came from.
+        from generate.lift import load_surface_points
+        import shutil
+        local = run_dir / "mesh.glb"
+        if Path(mesh_path).resolve() != local.resolve():
+            shutil.copy2(mesh_path, local)
+        mesh_vertices = load_surface_points(local)
+        models = [{"stage": "lift", "name": "external",
+                   "source": str(mesh_path), "seed": None}]
+        log(f"mesh: supplied by the caller ({Path(mesh_path).name}, "
+            f"{len(mesh_vertices)} verts) - no model was run")
+    elif not dry_run and photos:
         mesh_vertices, models = _generate(photos, prompt, run_dir, seed, log,
                                           photo_ev=photo_ev,
                                           use_mask=mask_for_generation,
@@ -313,6 +329,7 @@ def run(address: str,
         "mask_for_generation": bool(mask_for_generation),
         "conform": bool(conform),
         "lifter": lifter,
+        "mesh_path": str(mesh_path) if mesh_path else None,
     }
     if conform_info:
         record_dict["conform"] = conform_info
@@ -541,7 +558,7 @@ def _generation_input(photo, photo_ev, run_dir, log, *, use_mask, index=0):
 def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=True,
               lifter="trellis"):
     from generate.edit import edit_image
-    from generate.lift import lift_to_mesh, load_vertices
+    from generate.lift import lift_to_mesh, load_surface_points
 
     from generate.mask import enforce_background
 
@@ -587,7 +604,7 @@ def _generate(photos, prompt, run_dir, seed, log, *, photo_ev=None, use_mask=Tru
         {"stage": "edit", "name": "flux-kontext-pro", "seed": seed},
         {"stage": "lift", "name": lifter, "seed": seed, "params": params},
     ]
-    return load_vertices(glb), models
+    return load_surface_points(glb), models
 
 
 def _to_enu_polygon(poly_lonlat, frame):
@@ -689,6 +706,9 @@ def main(argv=None) -> int:
     ap.add_argument("--asset-id", default=None,
                     help="re-use an existing run directory: its cached edit and "
                          "mesh are used, so no model is re-run and nothing is billed")
+    ap.add_argument("--mesh", type=Path, default=None,
+                    help="place THIS model instead of generating one: any .glb "
+                         "trimesh can read, in any units and orientation")
     ap.add_argument("--lifter", choices=["trellis", "hunyuan"], default="trellis",
                     help="image-to-3D model. hunyuan = Hunyuan3D-2.1, a "
                          "different depth prior; single image only")
@@ -713,7 +733,8 @@ def main(argv=None) -> int:
                   asset_id=args.asset_id,
                   mask_for_generation=not args.no_mask,
                   force_candidate=args.force_candidate,
-                  conform=args.conform, lifter=args.lifter)
+                  conform=args.conform, lifter=args.lifter,
+                  mesh_path=args.mesh)
     except (LookupError, RuntimeError, ValueError) as exc:
         print(f"\nFAILED: {exc}", file=sys.stderr)
         return 1

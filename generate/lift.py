@@ -166,3 +166,27 @@ def load_vertices(glb_path: Path):
     if not chunks:
         raise ValueError(f"No geometry in {glb_path}")
     return np.vstack(chunks)
+
+
+def load_surface_points(glb_path: Path, n: int = 60_000):
+    """Load a .glb and return points sampled over its SURFACE. -> (N,3).
+
+    Prefer this to load_vertices for anything the outline is extracted from.
+    A vertex cloud describes the mesh's topology, not its shape: a modelled
+    asset puts four vertices on a whole wall, and spec 6.3's rasterisation then
+    sees specks (a downloaded 48 x 27 m block gave a 39 m2 "plan"). Generated
+    meshes are dense enough to hide the difference; bought ones are not.
+    """
+    import numpy as np
+    import trimesh
+
+    from geo.outline import sample_surface
+
+    scene = trimesh.load(str(glb_path), force="scene")
+    mesh = (scene if isinstance(scene, trimesh.Trimesh)
+            else trimesh.util.concatenate(list(scene.geometry.values())))
+    v = np.asarray(mesh.vertices, dtype=float)
+    f = np.asarray(mesh.faces, dtype=np.int64) if hasattr(mesh, "faces") else None
+    if f is None or len(f) == 0:
+        return v
+    return sample_surface(v, f, n=n)
