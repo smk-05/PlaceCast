@@ -18,7 +18,7 @@ and a confidence gate that refuses a bad placement rather than shipping it.
 
 | claim | evidence |
 |---|---|
-| A correctly shaped model is placed exactly | 1,680 benchmark solves against known truth: **median IoU 0.996**, orientation correct in 100% of clean cases ([`BENCHMARK.md`](BENCHMARK.md)) |
+| A correctly shaped model is placed exactly | 1,680 benchmark solves on 20 real campus footprints (7 corruptions × 3 poses × 4 solver configs), scored against known truth: **median IoU 0.996**, orientation correct in 100% of clean cases ([`BENCHMARK.md`](BENCHMARK.md)) |
 | The model's own frame doesn't matter | `scripts/scramble_demo.py`: the same mesh rotated 37°, scaled ×1000 and moved 1.2 km lands in the same place (**IoU 0.998**, scale recovered exactly) |
 | Size and position from an unknown model | `scripts/blind_placement_test.py`: with the azimuth right, corners land **0.25 m** from truth, scale within **0.1%** |
 | Bad placements are caught | **12 wrong auto-accepts in 1,680** (0.7%), all one case: a mirrored symmetric building, which is invisible in plan |
@@ -209,15 +209,66 @@ plan is elongated enough. `geo/disambiguate.py` then decides in priority order:
 The road prior is filtered to real streets, since campus "roads" are mostly
 footpaths. A confident EXIF heading is never overridden by render-and-compare.
 
+### Camera pose (prism texturing and openings)
+
+`perception/openings_prism.py` fits a pinhole camera to each photo so the photo
+can be projected onto the footprint prism.
+
+1. **Initial pose from EXIF.** Position is the photo's GPS converted to local
+   ENU, 1.5 m above the ground. Yaw is the EXIF compass heading; pitch and roll
+   start at 0 (iPhone photos carry no pitch). Focal length in pixels comes from
+   the 35 mm-equivalent focal length over the frame diagonal:
+   `f_px = f35 × diag_px / 43.27`.
+2. **Grid search.** The prism is projected into the image and its silhouette
+   scored against the building mask by plain IoU, over yaw ±15° (1° steps),
+   east/north ±24 m (4 m steps) and pitch 0–15° (2.5° steps): about 37k
+   silhouettes, scored in parallel. Focal length is held fixed, because it
+   trades off almost exactly against camera distance and drifted to the grid
+   edge when searched.
+3. **Refinement.** The best candidate is refined in position at 1 m steps.
+4. **Reliability check.** The fit is trusted only if IoU ≥ 0.6 and no axis
+   lands on the edge of the grid (an edge value means the optimum lies outside
+   it). Unreliable fits send that photo's openings to review and are not baked
+   unless forced.
+
+The fitted camera is stored in `record.json` and reused unchanged by
+`perception/prism_texture.py`, which projects each wall texel through it to
+sample the photo. Door and window boxes are placed by casting rays from the
+same camera onto the prism walls.
+
 ### Confidence gate
 
-The **threshold table** (`geo/validate.py`) is the default. A learned
-logistic-regression gate exists (`confidence/`, enabled with `--confidence
-learned` or `PROCEDURA_LEARNED_GATE`) and was evaluated leave-one-building-out
-on the benchmark: pooled AUC 0.921. At the table's coverage it makes 15 wrong
-auto-accepts to the table's 12, so it isn't safer, though it wrongly rejects far
-fewer good placements (24 vs 397). No trained model is shipped. A model flagged
-as trained on synthetic data is refused at load time.
+Every placement gets a decision: **accept**, **review** (sent to a human) or
+**reject**.
+
+- **Threshold table** (`geo/validate.py`): hand-set limits on IoU, Hausdorff,
+  area ratio, rotation margin, anisotropy and neighbour overlap. The default.
+- **Learned gate** (`confidence/`): L2 logistic regression on ten fit
+  features (`confidence/features.py`: footprint IoU, Hausdorff, area ratio,
+  rotation margins, anisotropy, neighbour overlap, rectilinearity, geocode
+  precision, height source). Three are constant on the benchmark and are
+  dropped there, leaving seven. It outputs a probability that the
+  placement is acceptable; thresholds for accept and reject are chosen for 95%
+  precision, and everything between goes to review. Hard rules (e.g. a
+  non-authoritative height) still floor the decision in both methods.
+
+The learned gate is trained and evaluated on the benchmark: 1,680 labelled
+solves from 20 buildings, a solve labelled good when IoU vs truth ≥ 0.8 and
+rotation error < 10°. Evaluation is **leave-one-building-out**, since the 84
+rows of one building share a footprint and row-level CV would leak. The
+regularisation strength and both thresholds are chosen inside each fold.
+
+```bash
+uv run python confidence/train.py --source benchmark --markdown BENCHMARK.md
+```
+
+Result: pooled out-of-fold **AUC 0.921**, accuracy 0.892 (majority baseline
+0.665). At the same coverage as the threshold table it makes 15 wrong
+auto-accepts to the table's 12, so it is not safer, but it wrongly rejects far
+fewer good placements (24 vs 397). That is why the table stays the default and
+the learned gate is opt-in (`--confidence learned` or
+`PROCEDURA_LEARNED_GATE`). Model files are written to `outputs/confidence/`,
+which is gitignored. Full tables are in [`BENCHMARK.md`](BENCHMARK.md).
 
 ### Perception backends
 
@@ -300,9 +351,8 @@ async one mid-build kills Cesium's renderer).
   `record["facade"]["front_heading_deg"]`, not `FitResult.heading_rad`.
 - **Monocular depth (UniDepth) isn't built**, although the 68% height coverage
   says it should be.
-- **The learned gate trains on the fake source only.** Benchmark rows are
-  emitted to `outputs/benchmark/labelled_fits.pkl`, but `confidence/train.py`
-  doesn't read them yet.
+- **The learned gate is evaluated on synthetic corruptions** of real
+  footprints, not on human-judged placements of generated meshes.
 - `pipeline.py` discards `segment_building`'s `occluded` flag and recomputes
   occlusion from the mask.
 - Benchmark strata in `scripts/demo_addresses.py` are guesses from building
