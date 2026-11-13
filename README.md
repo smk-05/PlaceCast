@@ -1,288 +1,316 @@
-# Photo → Map-Ready 3D Building
+# PlaceCast
 
-Address + photograph → AI redesign → 3D mesh → placed on a live map at the real
-building's location with correct position, scale, rotation and ground alignment,
-automatically.
+**Address + photo → 3D building, placed on a live map at the real building's
+location with correct position, scale, rotation and ground alignment.**
 
 Procedura AI / Scorched Nebraska challenge · VTHacks 14.
 
-**The generative half is API orchestration and works on day one. The entire
-engineering difficulty is in the placement**, so that is where this repository
-puts its weight.
+The generative half (FLUX redesign → image-to-3D) is API orchestration. The
+hard part is the placement, so most of this repository is placement: footprint
+retrieval, a closed-form similarity fit, four-fold orientation disambiguation,
+and a confidence gate that refuses a bad placement rather than shipping it.
+
+---
+
+## Results
+
+**The placement is right; the generated models are the weak link.**
+
+| claim | evidence |
+|---|---|
+| A correctly shaped model is placed exactly | 1,680 benchmark solves against known truth: **median IoU 0.996**, orientation correct in 100% of clean cases ([`BENCHMARK.md`](BENCHMARK.md)) |
+| The model's own frame doesn't matter | `scripts/scramble_demo.py`: the same mesh rotated 37°, scaled ×1000 and moved 1.2 km lands in the same place (**IoU 0.998**, scale recovered exactly) |
+| Size and position from an unknown model | `scripts/blind_placement_test.py`: with the azimuth right, corners land **0.25 m** from truth, scale within **0.1%** |
+| Bad placements are caught | **12 wrong auto-accepts in 1,680** (0.7%), all one case: a mirrored symmetric building, which is invisible in plan |
+
+**Six demo buildings** (ids in [`demo_assets.json`](demo_assets.json)):
+
+| building | IoU | Hausdorff | conformed IoU | conformed Hausdorff |
+|---|---|---|---|---|
+| New Classroom Building | 0.823 | 10.1 m | 0.842 | 12.2 m |
+| Burruss Hall | 0.820 | 13.6 m | 0.854 | 10.7 m |
+| Patton Hall | 0.623 | 9.8 m | **0.881** | **2.7 m** |
+| Goodwin Hall | 0.633 | 19.7 m | 0.661 | 26.5 m |
+| Whittemore Hall | 0.566 | 20.9 m | 0.772 | 10.0 m |
+| War Memorial Hall | 0.462 | 29.9 m | 0.469 | 28.8 m |
+
+All six generated meshes are **REJECT**, deliberately. They fail on Hausdorff
+(worst-case boundary error), not position. Single-photo 3D generation returns
+shallow shells with the wrong plan aspect (NCB 1.6:1 vs the real 2.2:1), and a
+uniform scale cannot fix a wrong aspect. Orientation came from the EXIF compass
+heading on all six.
+
+The **footprint prisms** (the real OSM footprint extruded to its real height,
+no generation) are correct on the map for all six, checked against satellite
+imagery.
 
 ---
 
 ## Quick start
 
+Windows / PowerShell. Every command is `uv run ...`: on Windows a Microsoft
+Store `python.exe` stub intercepts a bare `python`.
+
 ```powershell
-# One-time (winget)
+# One-time
 winget install --id Git.Git -e
 winget install --id astral-sh.uv -e
 winget install --id OpenJS.NodeJS.LTS -e
 # reopen the terminal, then:
 uv python install 3.11
 
-# Environment
+# Environment (geometry + generation)
 uv venv --python 3.11
 uv pip install -r requirements-geo.txt
-Copy-Item .env.example .env     # fill in the tokens
+Copy-Item .env.example .env     # REPLICATE_API_TOKEN, CESIUM_ION_TOKEN; Google key optional
 
 # Verify
-uv run pytest -q
+uv run pytest -q                # perception is forced to the stub in tests
 uv run python scripts/prefetch_footprints.py
 uv run python pipeline.py --address "Burruss Hall, Blacksburg, VA" --dry-run
 
-# Viewer
-cd web; npm install; npm run dev
-# and in a second terminal:
+# Viewer (two terminals) -> http://localhost:5173
 uv run uvicorn server.app:app --reload
+cd web; npm install; npm run dev
 ```
 
-Every command is `uv run ...`. There is a Microsoft Store `python.exe` alias
-stub on Windows that intercepts a bare `python`; `uv run` always resolves the
-venv interpreter and sidesteps it.
+Real perception (`--perception real`: Grounding DINO + SAM 2) needs a CUDA
+machine and the separate ML environment described at the top of
+`requirements-ml.txt`. Weights are 10+ GB, so set `HF_HOME` first.
 
----
+### Common runs
 
-## What runs today
+```bash
+# footprint prism only: no photo, no generation, free
+uv run python pipeline.py --address "Patton Hall, Blacksburg, VA" --dry-run
 
-`pipeline.py --dry-run` executes the whole chain end to end, using a plain box
-as the mesh. Output lands in `data/runs/<uuid>/`:
+# full path: photo -> FLUX Kontext -> TRELLIS -> placed (billed on Replicate)
+uv run python pipeline.py --address "Patton Hall, Blacksburg, VA" \
+    --photo photos/patton_1.jpg --perception real
+
+# re-solve an existing asset (cached edit + mesh, free); --conform stretches it onto the footprint
+uv run python pipeline.py --address "..." --photo photos/patton_1.jpg \
+    --perception real --asset-id <id> [--conform]
+
+# place a model you already have (no generation)
+uv run python pipeline.py --address "..." --mesh path/to/model.glb
+
+# the three proofs
+uv run python scripts/run_benchmark.py --reps 3          # writes BENCHMARK.md
+uv run python scripts/scramble_demo.py <asset-id>
+uv run python scripts/blind_placement_test.py --reps 3
+
+# check photos (EXIF GPS + heading) before spending anything
+uv run python scripts/check_photos.py
+```
+
+Other `pipeline.py` flags: `--lifter trellis|hunyuan`, `--confidence
+threshold_table|learned`, `--force-candidate 0-3`, `--no-mask`, `--seed`.
+
+Generation costs money (`scripts/generate_demo.py --yes`); everything else is
+free. Replicate calls are spaced 10 s apart and retry on 429
+(`generate/throttle.py`).
+
+### Output
+
+Each run writes `data/runs/<asset-id>/` (gitignored):
 
 | file | what |
 |---|---|
-| `record.json` | the spec 12.1 placement record — transform, metrics, provenance |
+| `record.json` | the placement record: transform, metrics, decision, provenance |
 | `overlay.png` | **the most useful file in the repo.** Footprint vs placement, all metrics, all four candidate orientations, and the reasons for the decision |
 | `run.log` | every stage, in order |
-| `mask.npy` | the cached segmentation mask (ingest-time, never recomputed at fit time) |
+| `mask.npy` | the cached segmentation mask (computed once at ingest) |
 
-Read the overlay before you read the numbers. An IoU of 0.91 on a building
-rotated 90° is the failure this project is about, and no scalar catches it.
+Read the overlay before the numbers. An IoU of 0.91 on a building rotated 90°
+is the failure this project is about, and no scalar catches it.
+
+### Viewer
+
+CesiumJS on Cesium World Terrain. The dropdown labels each run
+`address · mesh|prism · decision · IoU`.
+
+- **prism**: the OSM footprint extruded to its resolved height. Views:
+  **Photo** (default; the photo baked onto the walls through the fitted
+  camera), **Schematic** (flat colour), **Scorched** (experimental; the
+  Scorched Nebraska FLUX edit baked the same way). An "AI-filled" overlay marks
+  wall regions inpainted by FLUX Fill rather than seen by the camera. Photo and
+  Scorched textures exist only after a bake:
+  `uv run python perception/prism_texture.py <run_dir> <photo> <mask> [--scorched <edit>] [--ai]`
+  (camera from `perception/openings_prism.py`; `--ai` is billed and capped).
+- **mesh**: the generated model placed by the solver. Conformed runs sit beside
+  their originals.
+- **View from photo** puts the camera where the photo was taken.
+- **keep on map (compare)** draws the next selection alongside the current one;
+  **clear** empties the map.
 
 ---
 
-## Layout
+## How it works
 
 ```
-contracts.py         the frozen types every stage passes. Start here.
+address ──geocode──> OSM footprint (Overpass, cached) ──┐
+photo ──EXIF──> GPS + compass heading                   │
+photo ──Grounding DINO + SAM 2──> building mask         │
+      ──FLUX Kontext──> redesign ──TRELLIS──> mesh ──> ground outline
+                                                        │
+                       OMBB init → Umeyama similarity → IoU refinement
+                       → 4-fold orientation disambiguation
+                       → height chain → terrain
+                       → confidence gate (accept / review / reject)
+                                                        │
+                                       record.json + overlay.png → viewer
+```
+
+### Layout
+
+```
+contracts.py         frozen types every stage passes (v1.0, tag contracts-v1). Start here.
 pipeline.py          stage wiring, one direction of flow
 
-geo/                 the placement solver — spec 2-9
+geo/                 the placement solver
   coords.py          ENU / ECEF / geoid / the three angle conventions
   footprint.py       geocode, Overpass, selection rule, rectilinearity, OMBB
-  outline.py         up-axis, grounding, M_0 extraction, bas-relief rejection
+  outline.py         up-axis, grounding, ground-outline extraction, bas-relief rejection
   fit.py             OMBB init, Umeyama similarity Procrustes, IoU refinement
-  disambiguate.py    the four-fold azimuth ambiguity — NO ML required
-  validate.py        metrics + the threshold-table gate (the PRIMARY gate)
-  height.py          spec 7's four-tier priority chain
-  terrain.py         elevation sampling, sloped sites
+  disambiguate.py    the four-fold azimuth ambiguity
+  validate.py        metrics + the threshold-table gate
+  height.py          height priority chain
+  terrain.py         USGS 3DEP elevation, sloped sites
+  placement.py       composes the fit into one mesh → ENU matrix
+  exif.py            GPS + GPSImgDirection at ingest
   overlay.py         the debug overlay
-  exif.py            EXIF at ingest — free, and it beats every other cue
 
-generate/            spec 5 — FLUX Kontext + TRELLIS, hosted on Replicate
-perception/          addendum A/C — segmentation, silhouette, depth  [see below]
-confidence/          addendum B — the learned gate                   [see below]
+generate/            Replicate: FLUX Kontext (edit), TRELLIS / Hunyuan3D (lift),
+                     photo masking before generation, request throttling
+perception/          segmentation, silhouette render-and-compare, orientation ladder,
+                     facade openings (doors/windows), prism texturing + FLUX Fill
+confidence/          learned gate: features, training, leave-one-building-out eval
 
 web/                 CesiumJS viewer (Vite)
-server/app.py        FastAPI: records, assets, review queue
-fixtures/            fake_fits, fake_photo_evidence, the committed OSM cache
-scripts/             prefetch, height-coverage check, benchmark
-tests/               spec 14's synthetic + adversarial cases
+server/app.py        FastAPI: runs, assets, review queue, job submission
+fixtures/            fake fits / photo evidence, committed OSM footprint cache
+scripts/             prefetch, benchmark, proofs, photo checks, demo generation
+tests/               synthetic + adversarial cases
 ```
 
-## The division of labour
+### Orientation
 
-The ML half — addendum sections A (segmentation + silhouette scoring), B (the
-learned confidence gate) and C (monocular depth) — is developed separately and
-dropped in. **Nothing on the critical path blocks on it.** Every ML component
-ships with a working non-ML stand-in that is a permanent fallback, not a
-placeholder:
+An oriented bounding box fits a footprint four ways, 90° apart, and IoU often
+can't tell them apart. Aspect ratio first excludes the 90° candidates where the
+plan is elongated enough. `geo/disambiguate.py` then decides in priority order:
 
-| component | stand-in now | upgrade later |
-|---|---|---|
-| segmentation | central-box mask | Grounded SAM 2 |
-| silhouette scoring | abstains (margin 0) | render-and-compare |
-| confidence gate | spec 9.1 threshold table | logistic regression |
-| height | OSM tags → proportional | UniDepth |
+1. EXIF compass heading, if present and plausible
+2. silhouette score, if its margin is ≥ 0.08
+3. facade detail agreeing with the road normal
+4. road normal alone (always flagged for review)
+5. best footprint IoU (flagged if the margin is low)
 
-Orientation is the case that matters. Addendum A.3 leans on silhouette
-render-and-compare as "the only cue that is evidence rather than prior", but
-`geo/disambiguate.py` resolves the four-fold ambiguity with **no ML at all**:
-aspect-ratio arithmetic, EXIF `GPSImgDirection`, the road-normal prior, and
-facade-detail scoring from vertex density and normal variance. When the
-silhouette score arrives it becomes a *second, independent* signal — which is
-what the addendum actually wants, since disagreement between the two margins is
-itself a confidence feature.
+The road prior is filtered to real streets, since campus "roads" are mostly
+footpaths. A confident EXIF heading is never overridden by render-and-compare.
 
-### Handoff to the perception contributor
+### Confidence gate
 
-`contracts.py` is **frozen at v1.0** (git tag `contracts-v1`). Changing a field
-name, type or meaning needs both contributors, a `CONTRACT_VERSION` bump and a
-new tag.
+The **threshold table** (`geo/validate.py`) is the default. A learned
+logistic-regression gate exists (`confidence/`, enabled with `--confidence
+learned` or `PROCEDURA_LEARNED_GATE`) and was evaluated leave-one-building-out
+on the benchmark: pooled AUC 0.921. At the table's coverage it makes 15 wrong
+auto-accepts to the table's 12, so it isn't safer, though it wrongly rejects far
+fewer good placements (24 vs 397). No trained model is shipped. A model flagged
+as trained on synthetic data is refused at load time.
 
-Perception provides three functions; geometry provides one back:
+### Perception backends
 
-```python
-# perception -> geometry
-perception/segment.py        segment_building(path)  -> (mask, area_frac, occluded)
-perception/render_compare.py score_silhouettes(mesh, mask, candidates) -> {cid: iou}
-confidence/gate.py           score_confidence(fit, photo, fp) -> (p, Decision)
-
-# geometry -> perception
-geo/disambiguate.py          facade_heading(fp, mo, candidate) -> compass bearing, degrees
-```
-
-Where the confidence features live — everything `score_confidence` needs is on
-the three objects it receives:
-
-| addendum B.3 feature | read it from |
-|---|---|
-| `footprint_iou`, `hausdorff_m`, `anisotropy_log_ratio`, `max_neighbor_overlap` | `fit.*` |
-| `area_ratio_log` | `log(fit.area_ratio)` |
-| `rotation_margin_footprint` | `fit.rotation_margin_footprint` |
-| `rotation_margin_silhouette` | `photo.silhouette_margin` |
-| `exif_silhouette_disagree` | `fit.exif_silhouette_disagree` — `None` when a cue was absent |
-| `height_source_authoritative` | `fit.height_source_authoritative` |
-| `rectilinearity` | `fp.rectilinearity` |
-| `geocode_rooftop` | `fp.geocode_rooftop` |
-| footprint match quality | `fp.match_quality`, `fp.is_weak_match` |
-
-`exif_silhouette_disagree` lives on `FitResult`, not `PhotoEvidence`, because
-it can only be computed during disambiguation: mapping an EXIF bearing to a
-candidate needs `facade_heading`, which depends on the fitted mesh outline, and
-`PhotoEvidence` is frozen before geometry runs.
-
-Two warnings worth passing on:
-
-1. **No pyrender, no OpenGL.** Offscreen GL on Windows has no OSMesa and EGL is
-   Linux-only. Silhouette renders are plain triangle rasterisation in numpy.
-2. **Ordering is load-bearing.** `MeshOutline.is_bas_relief` (spec 6.4) is set
-   before any silhouette comparison. A flat relief matches well from its one
-   good view and would otherwise win the orientation vote while being
-   catastrophically wrong in 3D.
+`--perception stub` (the default in `pipeline.py`) uses a central-box mask and
+an abstaining silhouette scorer: no GPU. `--perception real` runs Grounding
+DINO + SAM 2 and render-and-compare. The record states which backend ran.
+Every ML component has a non-ML fallback, so nothing on the critical path
+depends on a GPU.
 
 ---
 
-## Measured findings
+## Findings
 
-Real numbers from live OSM on 2026-09-19, not estimates.
+Measured, not estimated.
 
-**Demo set** (`scripts/prefetch_footprints.py`):
+1. **Single-photo 3D generation gets depth wrong.** Models come back as shallow
+   shells: Patton's plan fills 18% of its bounding box against the real 81%.
+2. **Hunyuan3D-2.1 is worse here.** On NCB it gave a 4.8:1 sliver. It's kept as
+   `--lifter hunyuan`; TRELLIS stays the default.
+3. **A mirrored symmetric building is undetectable in plan.** All 12 wrong
+   benchmark auto-accepts are Cassell Coliseum mirrored. Only photo evidence
+   catches it.
+4. **Microsoft GlobalMLBuildingFootprints heights are 44–67% low** against the
+   five campus buildings with explicit OSM heights (all 20 values fall in a
+   7–16 m band). Microsoft is therefore not treated as authoritative.
+5. **OSM height coverage is 15/22 (68%)**, and only a third give metres
+   directly, so `building:levels × 3 m` and the proportional fallback are the
+   common path.
+6. **Three silent footprint bugs**, each a confident wrong answer rather than an
+   error, now regression-tested in `tests/test_footprint_selection.py`:
+   - Multi-way outer rings were truncated (Burruss read 4384 m² instead of
+     6136). Members must be stitched into rings before assembly.
+   - Multi-part relations collapsed to one part (Lane Stadium read 8930 m²
+     instead of 28042).
+   - The selection rule guessed when nothing matched (a demolished Randolph
+     Hall selected a wind tunnel 46 m away). It now fails loudly, except for
+     a narrow `unnamed_sole_candidate` case that is always routed to review.
+7. **Bought models break assumptions generated ones don't.** Outlines are now
+   read from sampled surfaces, not vertices (a wall with four vertices produced
+   no outline), and the up-axis sign comes from the base on the origin plane,
+   not vertex mass (a detailed roof inverted it).
 
-| building | OSM | area m² | R | aspect | height tag |
-|---|---|---|---|---|---|
-| Burruss Hall | relation | 6136 | 1.000 | 1.44 | 20.7 m |
-| Torgersen Hall | relation | 5353 | 0.919 | 2.42 | 6 levels |
-| Goodwin Hall | way | 4068 | 0.999 | 1.26 | 4 levels |
-| New Classroom Building | way | 2272 | 0.993 | 2.22 | 3 levels |
-| Moss Arts Center | way | 7897 | 1.000 | 1.08 | **none** |
+## Design decisions
 
-Moss Arts is the interesting one: aspect 1.08 is *below* spec 6.6 Filter 1's 1.1
-cutoff, so the 90° candidates cannot be excluded on scale grounds and the whole
-disambiguation chain has to carry it. It also has no height tag, so it exercises
-spec 7's fallback. Torgersen has the lowest R at 0.919 — a genuinely complex
-plan, with the bridge over Alumni Mall.
+**Geometry is closed-form; ML fills the perception gaps.** OMBB, Umeyama and
+IoU refinement are exact. We didn't train a network to approximate a solved
+problem.
 
-**Height coverage** (`scripts/check_height_coverage.py`) — **15/22 = 68%**.
+**Store the transform, never the transformed mesh.** The transform is ten
+floats. Model versions, seeds and the footprint's OSM *version* are pinned,
+because OSM footprints get edited.
 
-Below the addendum's 80% threshold, so its conditional flips: monocular depth
-(or the cheaper single-view metrology of C.4) should be built, not skipped. The
-breakdown matters more than the headline — only a third of buildings give metres
-directly, and `building:levels × 3 m` is load-bearing for the rest, so the
-fallback chain is the common path rather than the exception.
+**Reflections are rejected.** The fit optimises over SO(2), not O(2); Umeyama's
+`S` correction stops the SVD returning a mirror, and
+`tests/test_fit_synthetic.py` asserts it.
 
-**Microsoft GlobalMLBuildingFootprints** (`scripts/check_microsoft_heights.py`)
-covers 6 of the 7 OSM-untagged buildings (not Hutcheson) — but its heights are
-not trustworthy here. Against the five buildings with an explicit OSM `height`
-in metres, it underestimated every one:
+**The redesign must not change the silhouette.** `generate/edit.py` rejects
+silhouette-mutating prompts, and `geo/outline.py` fits only the lowest 15% of
+the mesh.
 
-| building | OSM `height` | Microsoft | error |
-|---|---|---|---|
-| Burruss | 20.7 | 11.3 | −45% |
-| McBryde | 23.9 | 11.6 | −51% |
-| Whittemore | 37.4 | 12.2 | −67% |
-| Patton | 16.4 | 9.2 | −44% |
-| War Memorial | 18.8 | 9.0 | −52% |
+**No OpenGL anywhere.** Silhouettes are rasterised in numpy and the overlay is
+matplotlib, because offscreen GL on Windows has no OSMesa and EGL is Linux-only.
 
-All 20 Microsoft values fall in a 7–16 m band. So Microsoft is **not**
-authoritative in this codebase (deviating from spec §7.1) and ranks below
-monocular depth in the height chain. Section C is still needed. Those five
-buildings are also the natural ground truth for validating it.
-
----
-
-**Three silent footprint bugs**, found on live data and now regression-tested in
-`tests/test_footprint_selection.py`. Each produced a confident, plausible, wrong
-answer rather than an error — the worst failure mode this pipeline has:
-
-1. **Multi-way outer rings were truncated.** OSM routinely splits one outer ring
-   across several member ways that must be stitched end-to-end. Taking the first
-   member shrank Burruss Hall — the primary demo building — from 6136 to 4384 m²
-   and inverted its rectilinearity. Note that "build a MultiPolygon from the
-   outer members" is *also* wrong here: those members are open segments, so it
-   yields four degenerate slivers. Stitch into rings first, then assemble.
-2. **Multi-part relations collapsed to one part.** Lane Stadium is four disjoint
-   stands with the field as a genuine gap; it read 8930 m² instead of 28042.
-   Spec §3.3 covers interior rings but never names this case.
-3. **The §3.2 selection rule guessed instead of failing.** Step 2 ranks
-   candidates, but the spec never says what to do when nothing matches — and
-   ranking always returns something. A demolished Randolph Hall selected the
-   "Stability Wind Tunnel", 360 m², 46 m away, no name match. Selection now
-   fails loudly and names the candidates, with one narrow exception
-   (`unnamed_sole_candidate`) that is tagged as weak evidence and routed to
-   review however good the IoU looks.
-
-`Footprint.match_quality` carries the outcome of (3) into the placement record
-as a confidence feature.
-
-## Design decisions worth knowing
-
-**Geometry is closed-form; ML fills the perception gaps.** OMBB initialisation,
-Umeyama's similarity Procrustes and IoU refinement are exact. We did not train a
-network to approximate a solved problem. The learned component is the confidence
-gate, and the threshold table stays in the codebase as the fallback path.
-
-**Store the transform, never the transformed mesh.** The mesh is a large binary;
-the transform is ten floats. Model versions, seeds and the footprint's OSM
-*version* are all pinned, because OSM footprints get edited and a re-fetch six
-months later may silently return a different polygon.
-
-**The silhouette-mutation tension** (spec 10.1) is real and is named rather than
-hidden: a redesign that changes the silhouette no longer matches the real
-footprint. `generate/edit.py` rejects silhouette-mutating prompts up front, and
-`geo/outline.py` fits the base only — the lowest 15% of the mesh, the part most
-likely to preserve the original plan.
-
-**Reflections are rejected, never accepted.** We optimise over SO(2), not O(2).
-Umeyama's `S` correction is what stops the SVD silently returning a mirror, and
-`tests/test_fit_synthetic.py` asserts it on deliberately reflected data.
-
-**No OpenGL anywhere.** Spec 6.3's ground-outline extraction is an occupancy
-grid in numpy, and the overlay is matplotlib.
+**One angle conversion per side.** The solver uses mathematical θ (CCW from
+East); Cesium uses compass heading (`π/2 − θ`). The viewer disables both of
+Cesium's glTF axis corrections because the model matrix carries the full
+rotation, and all viewer polygons are synchronous primitives (deleting an
+async one mid-build kills Cesium's renderer).
 
 ---
 
 ## Known gaps
 
-- The learned gate exists (`confidence/features.py`, `train.py`, `gate.py`) but is trained on
-  SYNTHETIC rows only (`fixtures/fake_fits.py`); `model.json` says so and `gate.py` refuses to
-  use it. It needs the real spec 11 benchmark rows. Until a real model exists, `--confidence
-  learned` falls back to the threshold table and records that in the review reasons.
-- Perception runs the REAL models by default (Grounding DINO + SAM 2) when a caller names no
-  backend. `pipeline.py` always names one: its `--perception` flag (default `stub`) is passed
-  through to `perception/` and beats `PROCEDURA_PERCEPTION`, and the record shows the backend
-  that actually ran. Run `--perception real` only on a machine with the ML stack. The test
-  suite forces the stub in `tests/conftest.py`.
-- With a real segmentation mask, the photographed side of the mesh sets
-  `MeshOutline.front_angle` (margin ≥ 0.08); otherwise the glTF "front is +Z" convention is
-  assumed. The EXIF and road-normal cues both depend on it.
-- `score_silhouettes` is flat across `azimuth_k` on purpose (see `tests/test_azimuth_contract.py`):
-  a silhouette of the mesh front cannot depend on which quarter-turn the placed mesh gets.
-- `geo/terrain.py` uses USGS 3DEP (orthometric, needs the geoid correction).
-  The viewer's Cesium World Terrain path is already ellipsoidal and is primary.
+- **Silhouette scoring doesn't vote.** `score_silhouettes` is flat across the
+  four azimuth candidates by construction (`tests/test_azimuth_contract.py`),
+  so orientation relies on EXIF and the priors.
+- **The photographed side rarely clears its 0.08 margin** (measured
+  0.002–0.047 on the demo set), so the mesh front usually falls back to the
+  glTF "+Z is front" convention. For facade bearings, use
+  `record["facade"]["front_heading_deg"]`, not `FitResult.heading_rad`.
+- **Monocular depth (UniDepth) isn't built**, although the 68% height coverage
+  says it should be.
+- **The learned gate trains on the fake source only.** Benchmark rows are
+  emitted to `outputs/benchmark/labelled_fits.pkl`, but `confidence/train.py`
+  doesn't read them yet.
+- `pipeline.py` discards `segment_building`'s `occluded` flag and recomputes
+  occlusion from the mask.
 - Benchmark strata in `scripts/demo_addresses.py` are guesses from building
-  names. Two such guesses were already wrong in the demo set — verify each
-  against measured aspect and R before the benchmark run.
-- Not built, in deliberate cut order: branch-and-bound certified global solve
-  (spec 6.10), C2PA signing (12.2), skirt geometry for sloped sites (8),
-  turning-function screening (6.7).
+  names. Verify against measured aspect and rectilinearity before relying on
+  them.
+- Not built, in cut order: certified global solve, C2PA signing, skirt geometry
+  for sloped sites, turning-function screening.
+
+See [`HANDOVER.md`](HANDOVER.md) for asset ids and run state,
+[`BENCHMARK.md`](BENCHMARK.md) for full tables, and [`SPEC.md`](SPEC.md) /
+[`ML_ADDENDUM.md`](ML_ADDENDUM.md) for the original design.
