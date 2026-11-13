@@ -183,8 +183,9 @@ geo/                 the placement solver
 
 generate/            Replicate: FLUX Kontext (edit), TRELLIS / Hunyuan3D (lift),
                      photo masking before generation, request throttling
-perception/          segmentation, silhouette render-and-compare, orientation ladder,
-                     facade openings (doors/windows), prism texturing + FLUX Fill
+perception/          building segmentation (Grounding DINO + SAM 2), door/window detection
+                     (Grounding DINO), silhouette render-and-compare, orientation ladder,
+                     camera fitting, prism texturing + FLUX Fill
 confidence/          learned gate: features, training, leave-one-building-out eval
 
 web/                 CesiumJS viewer (Vite)
@@ -208,6 +209,33 @@ plan is elongated enough. `geo/disambiguate.py` then decides in priority order:
 
 The road prior is filtered to real streets, since campus "roads" are mostly
 footpaths. A confident EXIF heading is never overridden by render-and-compare.
+
+### Doors and windows
+
+`perception/openings.py` finds the facade openings in each photo, so each door
+and window can become its own interactable element in the game.
+
+1. **Detection.** Grounding DINO is prompted with `door . window . garage door .
+   entrance`, restricted to the building mask's bounding box with pixels
+   outside the mask greyed out (so it doesn't detect car doors). It runs over
+   tiles at two sizes so small windows on wide facades keep enough pixels, and
+   the results are merged with non-maximum suppression. SAM 2 is used only for
+   the building mask, not for the openings.
+2. **Scoring.** Per-class scores are read from DINO's token logits, along with
+   distractor classes (vent, sign, lamp, column, chimney, balcony). A box
+   where a distractor wins becomes "other".
+3. **Geometric priors.** Ground contact, aspect ratio, and repetition in rows
+   (two or more row peers is strong evidence of a window).
+4. **Gap fill.** Accepted windows become templates. Normalised
+   cross-correlation along the window rows proposes missed windows, and each is
+   verified by re-running DINO on a wider crop.
+5. **Decision.** Each opening is classed as passable (door, garage door,
+   entrance), window or other, and sent to review when that choice is weak or
+   ambiguous.
+
+The 2D boxes are then placed in 3D by casting rays from the fitted camera onto
+the prism walls (below), and each opening gets its wall's outward compass
+bearing.
 
 ### Camera pose (prism texturing and openings)
 
